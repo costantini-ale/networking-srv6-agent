@@ -32,6 +32,12 @@ from oslo_utils import uuidutils
 # key onto it and the test database enforces that.
 from networking_srv6_agent.db import domain_db
 from networking_srv6_agent.db import te_db
+from networking_srv6_agent.services import te_resolver
+
+
+def _ranked(ctx, domain_id):
+    """A domain's rows as the resolver ranks them for a payload."""
+    return te_resolver.rank(te_db.get_te_paths(ctx, domain_id))
 
 
 class Srv6TeDbTestCase(testlib_api.SqlTestCase):
@@ -337,7 +343,7 @@ class TestGetAllTePaths(Srv6TeDbTestCase):
 
 
 class TestPayloadHelpers(Srv6TeDbTestCase):
-    """The lookups the plugin uses when building RPC payloads."""
+    """The rows the plugin reads for a payload, ranked by the resolver."""
 
     def test_paths_for_domain_keeps_the_two_selectors_apart(self):
         port_id = self._create_port()
@@ -348,13 +354,13 @@ class TestPayloadHelpers(Srv6TeDbTestCase):
             {'by_port': {port_id: ['cn5']},
              'by_host': {'cn3': ['cn2'], 'cn4': ['cn2', 'cn5']},
              'by_source': {}, 'by_source_port': {}},
-            te_db.get_te_paths_for_domain(self.ctx, self.domain_id))
+            _ranked(self.ctx, self.domain_id))
 
     def test_paths_for_domain_is_empty_without_policy(self):
         self.assertEqual(
             {'by_port': {}, 'by_host': {}, 'by_source': {},
              'by_source_port': {}},
-            te_db.get_te_paths_for_domain(self.ctx, self.domain_id))
+            _ranked(self.ctx, self.domain_id))
 
     def test_paths_for_domain_is_scoped_to_the_domain(self):
         other_domain = self._create_domain()
@@ -362,14 +368,14 @@ class TestPayloadHelpers(Srv6TeDbTestCase):
         self.assertEqual(
             {'by_port': {}, 'by_host': {}, 'by_source': {},
              'by_source_port': {}},
-            te_db.get_te_paths_for_domain(self.ctx, self.domain_id))
+            _ranked(self.ctx, self.domain_id))
 
     def test_an_explicitly_direct_path_is_still_listed(self):
         # [] is a decision -- "direct" -- and must win over a host path for
         # its port, so it cannot simply be left out of the map.
         port_id = self._create_port()
         self._create_port_path(port_id, via_hosts=[])
-        self.assertEqual({port_id: []}, te_db.get_te_paths_for_domain(
+        self.assertEqual({port_id: []}, _ranked(
             self.ctx, self.domain_id)['by_port'])
 
 
@@ -449,7 +455,7 @@ class TestSourceSelector(Srv6TeDbTestCase):
                          'by_host': {'cn3': ['cn5']}},
                  'cn5': {'by_port': {}, 'by_host': {'cn4': ['cn2']}}},
              'by_source_port': {}},
-            te_db.get_te_paths_for_domain(self.ctx, self.domain_id))
+            _ranked(self.ctx, self.domain_id))
 
     def test_paths_for_domain_does_not_depend_on_row_order(self):
         # Same two paths, created in both orders in two domains: a map
@@ -463,8 +469,8 @@ class TestSourceSelector(Srv6TeDbTestCase):
         self._create_path(destination_host='cn3', via_hosts=['cn2'],
                           domain_id=other_domain)
         self.assertEqual(
-            te_db.get_te_paths_for_domain(self.ctx, self.domain_id),
-            te_db.get_te_paths_for_domain(self.ctx, other_domain))
+            _ranked(self.ctx, self.domain_id),
+            _ranked(self.ctx, other_domain))
 
 
 class TestSourcePort(Srv6TeDbTestCase):
@@ -499,7 +505,7 @@ class TestSourcePort(Srv6TeDbTestCase):
             {'by_port': {dst: ['cn5']}, 'by_host': {}, 'by_source': {},
              'by_source_port': {vm: {'by_port': {dst: ['cn4']},
                                      'by_host': {'cn3': []}}}},
-            te_db.get_te_paths_for_domain(self.ctx, self.domain_id))
+            _ranked(self.ctx, self.domain_id))
 
     def test_two_vms_to_one_destination_next_to_an_any_source_path(self):
         a, b, dst = (self._create_port() for _ in range(3))

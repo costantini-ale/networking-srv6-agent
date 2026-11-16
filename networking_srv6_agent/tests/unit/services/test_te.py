@@ -36,6 +36,7 @@ from networking_srv6_agent.api.definitions import srv6_te as te_def
 from networking_srv6_agent.common import config
 from networking_srv6_agent.db import srv6_db
 from networking_srv6_agent.services import plugin
+from networking_srv6_agent.services import te_resolver
 from networking_srv6_agent.tests.unit.services import test_plugin
 
 
@@ -386,6 +387,29 @@ def _db_path(**kwargs):
     return path
 
 
+def _rows(by_port=None, by_host=None, by_source=None, by_source_port=None):
+    """te_db rows from precedence maps.
+
+    by_source and by_source_port are {source: (by_port, by_host)}.
+    """
+    rows = []
+
+    def add(ports, hosts, **source):
+        for port_id, via in (ports or {}).items():
+            rows.append(_db_path(id='tp%d' % len(rows),
+                                 destination_port_id=port_id,
+                                 via_hosts=via, **source))
+        for host, via in (hosts or {}).items():
+            rows.append(_db_path(id='tp%d' % len(rows), destination_host=host,
+                                 via_hosts=via, **source))
+    add(by_port, by_host)
+    for source, (ports, hosts) in (by_source or {}).items():
+        add(ports, hosts, source_host=source)
+    for port_id, (ports, hosts) in (by_source_port or {}).items():
+        add(ports, hosts, source_port_id=port_id)
+    return rows
+
+
 class TePluginTestCaseBase(test_plugin.PluginUnitTestCaseBase):
 
     locators = {'node1': LOC1, 'node2': LOC2, 'node3': LOC3}
@@ -400,162 +424,12 @@ class TePluginTestCaseBase(test_plugin.PluginUnitTestCaseBase):
             {'host': host, 'alive': True} for host in self.locators]
         self.srv6_db.get_function_id.return_value = 7
 
-    def _paths(self, by_port=None, by_host=None, by_source=None):
-        """The te_db maps; by_source is {source: (by_port, by_host)}."""
-        self.te_db.get_te_paths_for_domain.return_value = {
-            'by_port': by_port or {}, 'by_host': by_host or {},
-            'by_source': {source: {'by_port': ports or {},
-                                   'by_host': hosts or {}}
-                          for source, (ports, hosts)
-                          in (by_source or {}).items()}}
-
-
-class TestPrecedence(TePluginTestCaseBase):
-    """Port path > host path > direct."""
-
-    def _attach(self, *routes):
-        return self.plugin._attach_segments(self.ctx, 'd1', list(routes),
-                                            self.locators)
-
-    def test_a_port_path_beats_the_host_path(self):
-        self._paths(by_port={'p1': ['node3']}, by_host={'node2': ['node1']})
-        routes = self._attach(_route('p1'), _route('p2', prefix='10.0.0.6/32'))
-        self.assertEqual(['fc00:0:3:fff0::'], routes[0]['segments'])
-        # G3: the neighbour follows the host path.
-        self.assertEqual(['fc00:0:1:fff0::'], routes[1]['segments'])
-
-    def test_a_host_path_leaves_other_hosts_alone(self):
-        self._paths(by_host={'node2': ['node1']})
-        route = self._attach(_route('p1', host='node3'))[0]
-        self.assertNotIn('segments', route)
-
-    def test_an_empty_port_path_is_direct_even_under_a_host_path(self):
-        self._paths(by_port={'p1': []}, by_host={'node2': ['node1']})
-        self.assertNotIn('segments', self._attach(_route('p1'))[0])
-
-    def test_no_path_leaves_the_p5_route_untouched(self):
-        route = _route('p1')
-        self.assertEqual([dict(route)], self._attach(route))
-
-    def test_transit_sids_only_in_traversal_order(self):
-        # The agent appends the decap SID itself.
-        self._paths(by_port={'p1': ['node3', 'node1']})
-        self.assertEqual(['fc00:0:3:fff0::', 'fc00:0:1:fff0::'],
-                         self._attach(_route('p1'))[0]['segments'])
-
-    def test_a_degraded_port_path_goes_direct_not_to_the_host_path(self):
-        self._paths(by_port={'p1': ['node9']}, by_host={'node2': ['node1']})
-        with mock.patch.object(plugin.LOG, 'warning') as warning:
-            route = self._attach(_route('p1'))[0]
-        self.assertNotIn('segments', route)
-        self.assertTrue(warning.called)
-
-    def test_a_degraded_host_path_goes_direct(self):
-        self._paths(by_host={'node2': ['node3', 'node9']})
-        self.assertNotIn('segments', self._attach(_route('p1'))[0])
+    def _paths(self, **maps):
+        """The domain's te_db rows, from precedence maps (_rows)."""
+        self.te_db.get_te_paths.return_value = _rows(**maps)
 
 
 E1, E2, E3 = 'fc00:0:1:fff0::', 'fc00:0:2:fff0::', 'fc00:0:3:fff0::'
-
-
-class TestSourcePrecedence(TePluginTestCaseBase):
-    """(port, src) > (host, src) > (port, any) > (host, any) > direct.
-
-    The routes go to every node. `segments` is what every ingress pushes;
-    `segments_by_source` holds the answer of each source whose paths
-    apply, and that node's agent uses it instead -- even when it is [].
-    """
-
-    def _attach(self, *routes):
-        return self.plugin._attach_segments(self.ctx, 'd1', list(routes),
-                                            self.locators)
-
-    def test_only_source_paths_still_steer(self):
-        # A domain whose only path names a source: no early return.
-        self._paths(by_source={'node1': (None, {'node2': ['node3']})})
-        route = self._attach(_route('p1'))[0]
-        self.assertNotIn('segments', route)
-        self.assertEqual({'node1': [E3]}, route['segments_by_source'])
-
-    def test_a_source_port_path_beats_a_source_host_path(self):
-        self._paths(by_source={'node1': ({'p1': []}, {'node2': ['node3']})})
-        steered, neighbour = self._attach(
-            _route('p1'), _route('p2', prefix='10.0.0.6/32'))
-        self.assertEqual({'node1': []}, steered['segments_by_source'])
-        self.assertEqual({'node1': [E3]}, neighbour['segments_by_source'])
-
-    def test_a_source_host_path_beats_an_any_source_port_path(self):
-        # The source rank wins, at that ingress only.
-        self._paths(by_port={'p1': ['node1']},
-                    by_source={'node1': (None, {'node2': ['node3']})})
-        route = self._attach(_route('p1'))[0]
-        self.assertEqual([E1], route['segments'])
-        self.assertEqual({'node1': [E3]}, route['segments_by_source'])
-
-    def test_an_explicitly_direct_source_path_is_sent_empty(self):
-        # Left out, node1 would fall back to `segments`.
-        self._paths(by_host={'node2': ['node3']},
-                    by_source={'node1': (None, {'node2': []})})
-        route = self._attach(_route('p1'))[0]
-        self.assertEqual([E3], route['segments'])
-        self.assertEqual({'node1': []}, route['segments_by_source'])
-
-    def test_a_degraded_source_path_is_direct_for_its_source(self):
-        # Not "fall back to the any-source path".
-        self._paths(by_host={'node2': ['node3']},
-                    by_source={'node1': (None, {'node2': ['node9']})})
-        with mock.patch.object(plugin.LOG, 'warning') as warning:
-            route = self._attach(_route('p1'))[0]
-        self.assertEqual([E3], route['segments'])
-        self.assertEqual({'node1': []}, route['segments_by_source'])
-        self.assertTrue(warning.called)
-
-    def test_a_source_without_a_locator_is_direct(self):
-        self._paths(by_source={'node9': (None, {'node2': ['node3']})})
-        with mock.patch.object(plugin.LOG, 'warning'):
-            route = self._attach(_route('p1'))[0]
-        self.assertEqual({'node9': []}, route['segments_by_source'])
-
-    def test_a_direct_any_source_port_path_keeps_the_source_entry(self):
-        # The any-source answer is "nothing"; the loop must still reach
-        # the source pass.
-        self._paths(by_port={'p1': []},
-                    by_source={'node1': (None, {'node2': ['node3']})})
-        route = self._attach(_route('p1'))[0]
-        self.assertNotIn('segments', route)
-        self.assertEqual({'node1': [E3]}, route['segments_by_source'])
-
-    def test_no_applicable_source_path_adds_no_key(self):
-        # node1's path goes to node3; this route is on node2.
-        self._paths(by_host={'node2': ['node3']},
-                    by_source={'node1': (None, {'node3': ['node2']})})
-        route = self._attach(_route('p1'))[0]
-        self.assertEqual([E3], route['segments'])
-        self.assertNotIn('segments_by_source', route)
-
-    def test_the_routes_own_host_gets_no_entry(self):
-        # A port path whose VM has moved onto its source: that node never
-        # encapsulates traffic toward its own VMs.
-        self._paths(by_source={'node2': ({'p1': ['node3']}, None)})
-        self.assertNotIn('segments_by_source',
-                         self._attach(_route('p1'))[0])
-
-    def test_each_source_gets_its_own_entry(self):
-        self._paths(by_host={'node2': ['node1']},
-                    by_source={'node1': (None, {'node2': ['node3']}),
-                               'node3': (None, {'node2': []})})
-        route = self._attach(_route('p1'))[0]
-        self.assertEqual([E1], route['segments'])
-        self.assertEqual({'node1': [E3], 'node3': []},
-                         route['segments_by_source'])
-
-    def test_a_source_entry_keeps_the_sources_own_sid(self):
-        # The server sends the list as resolved; the source's agent drops
-        # its own leading SID, as it does for `segments`.
-        self._paths(by_source={'node1': (None, {'node2': ['node1',
-                                                          'node3']})})
-        self.assertEqual({'node1': [E1, E3]},
-                         self._attach(_route('p1'))[0]['segments_by_source'])
 
 
 class TestPayloadCarriesTe(TePluginTestCaseBase):
@@ -592,7 +466,7 @@ class TestPayloadCarriesTe(TePluginTestCaseBase):
 
     def test_paths_are_read_once_per_payload(self):
         self._routes()
-        self.te_db.get_te_paths_for_domain.assert_called_once_with(
+        self.te_db.get_te_paths.assert_called_once_with(
             self.ctx.elevated.return_value, mock.ANY)
 
 
@@ -627,18 +501,17 @@ class TestIncrementalPathCarriesTe(TePluginTestCaseBase):
 
     def test_segments_are_per_domain(self):
         self.domain_db.get_domain_ids_for_network.return_value = ['d1', 'd2']
-        self.te_db.get_te_paths_for_domain.side_effect = \
-            lambda ctx, domain_id: {
-                'by_port': ({self.port['id']: ['node1']}
-                            if domain_id == 'd1' else {}),
-                'by_host': {}}
+        self.te_db.get_te_paths.side_effect = \
+            lambda ctx, domain_id: _rows(
+                by_port={self.port['id']: ['node1']} if domain_id == 'd1'
+                else {})
         self.plugin._notify_port(self.ctx, self.port)
         self.assertEqual(['fc00:0:1:fff0::'], self._added(0)[0]['segments'])
         self.assertNotIn('segments', self._added(1)[0])
 
     def test_a_withdrawal_needs_no_paths(self):
         self.plugin._notify_port(self.ctx, self.port, removed=True)
-        self.te_db.get_te_paths_for_domain.assert_not_called()
+        self.te_db.get_te_paths.assert_not_called()
         removed = self.agent_rpc.routes_updated.call_args[1]['remove']
         self.assertNotIn('segments', removed[0])
 
@@ -654,22 +527,11 @@ class TestIncrementalPathCarriesTe(TePluginTestCaseBase):
 
 
 class TestResolveTePath(TePluginTestCaseBase):
+    """The bindings the plugin reads for Resolver.resolve."""
 
     def _resolve(self, path, function_id=7):
         return self.plugin._resolve_te_path(self.ctx, path, self.locators,
                                             function_id)
-
-    def test_shape_and_order(self):
-        path = self._resolve(_db_path(destination_host='node2',
-                                      via_hosts=['node3', 'node1']))
-        self.assertEqual(['fc00:0:3:fff0::', 'fc00:0:1:fff0::',
-                          'fc00:0:2:7::'], path['segments'])
-        self.assertEqual('ACTIVE', path['status'])
-
-    def test_the_function_id_is_hex_in_the_sid(self):
-        path = self._resolve(_db_path(destination_host='node2'),
-                             function_id=17)
-        self.assertEqual(['fc00:0:2:11::'], path['segments'])
 
     def test_a_port_path_resolves_through_the_binding(self):
         self.core.get_port.return_value = {portbindings.HOST_ID: 'node2'}
@@ -691,47 +553,6 @@ class TestResolveTePath(TePluginTestCaseBase):
         self.assertEqual('DEGRADED', self._resolve(
             _db_path(destination_port_id='p1'))['status'])
 
-    def test_a_lost_waypoint_is_degraded(self):
-        # G6: the via host's locator row is gone.
-        path = self._resolve(_db_path(destination_host='node2',
-                                      via_hosts=['node9']))
-        self.assertEqual(([], 'DEGRADED'), (path['segments'],
-                                            path['status']))
-
-    def test_a_destination_without_a_locator_is_degraded(self):
-        self.assertEqual('DEGRADED', self._resolve(
-            _db_path(destination_host='node9'))['status'])
-
-    def test_a_domain_without_a_function_id_is_degraded(self):
-        self.assertEqual('DEGRADED', self._resolve(
-            _db_path(destination_host='node2'), function_id=None)['status'])
-
-    def test_a_source_path_drops_its_own_leading_sid(self):
-        # The source is the only ingress, and its agent drops the SID.
-        path = self._resolve(_db_path(destination_host='node2',
-                                      source_host='node1',
-                                      via_hosts=['node1', 'node3']))
-        self.assertEqual([E3, 'fc00:0:2:7::'], path['segments'])
-        self.assertEqual(path['segments'], path['encoded_segments'])
-        self.assertEqual('ACTIVE', path['status'])
-
-    def test_only_leading_source_sids_are_dropped(self):
-        path = self._resolve(_db_path(destination_host='node2',
-                                      source_host='node1',
-                                      via_hosts=['node3', 'node1']))
-        self.assertEqual([E3, E1, 'fc00:0:2:7::'], path['segments'])
-
-    def test_an_any_source_path_keeps_every_sid(self):
-        # Any node may be the ingress; each strips its own SID itself.
-        path = self._resolve(_db_path(destination_host='node2',
-                                      via_hosts=['node1', 'node3']))
-        self.assertEqual([E1, E3, 'fc00:0:2:7::'], path['segments'])
-
-    def test_a_source_without_a_locator_is_degraded(self):
-        self.assertEqual('DEGRADED', self._resolve(
-            _db_path(destination_host='node2', source_host='node9'))[
-                'status'])
-
     def test_a_port_moved_onto_its_source_is_degraded(self):
         self.core.get_port.return_value = {portbindings.HOST_ID: 'node1'}
         path = self._resolve(_db_path(destination_port_id='p1',
@@ -739,11 +560,6 @@ class TestResolveTePath(TePluginTestCaseBase):
                                       via_hosts=['node3']))
         self.assertEqual(([], 'DEGRADED'), (path['segments'],
                                             path['status']))
-
-    def test_the_db_dict_is_not_mutated(self):
-        original = _db_path(destination_host='node2')
-        self._resolve(original)
-        self.assertEqual(_db_path(destination_host='node2'), original)
 
 
 class TestCreate(TePluginTestCaseBase):
@@ -943,53 +759,10 @@ class TestDeadWaypoint(TePluginTestCaseBase):
     def test_a_host_path_through_a_dead_node_goes_direct(self):
         self._paths(by_host={'node2': ['node1']})
         self._agents('node1')
-        with mock.patch.object(plugin.LOG, 'warning') as warning:
+        with mock.patch.object(te_resolver.LOG, 'warning') as warning:
             route = self._attach(_route('p1'))[0]
         self.assertNotIn('segments', route)
         self.assertTrue(warning.called)
-
-    def test_the_same_path_is_steered_while_the_node_lives(self):
-        self._paths(by_host={'node2': ['node1']})
-        self._agents()
-        self.assertEqual([E1], self._attach(_route('p1'))[0]['segments'])
-
-    def test_a_dead_node_off_the_path_changes_nothing(self):
-        self._paths(by_host={'node2': ['node1']})
-        self._agents('node3')
-        self.assertEqual([E1], self._attach(_route('p1'))[0]['segments'])
-
-    def test_one_dead_hop_sends_the_whole_path_direct(self):
-        # Not a shorter list: that is the partial steering the plugin refuses.
-        self._paths(by_host={'node2': ['node3', 'node1']})
-        self._agents('node1')
-        self.assertNotIn('segments', self._attach(_route('p1'))[0])
-
-    def test_a_dead_port_path_goes_direct_not_to_the_host_path(self):
-        self._paths(by_port={'p1': ['node1']}, by_host={'node2': ['node3']})
-        self._agents('node1')
-        route = self._attach(_route('p1'), _route('p2', prefix='10.0.0.6/32'))
-        self.assertNotIn('segments', route[0])
-        self.assertEqual([E3], route[1]['segments'])
-
-    def test_a_dead_node_off_a_source_path_leaves_it(self):
-        self._paths(by_source={'node1': (None, {'node2': ['node3']})})
-        self._agents('node2')
-        route = self._attach(_route('p1'))[0]
-        self.assertEqual({'node1': [E3]}, route['segments_by_source'])
-
-    def test_a_source_path_through_a_dead_node_is_direct_for_its_source(self):
-        self._paths(by_host={'node2': ['node3']},
-                    by_source={'node1': (None, {'node2': ['node1']})})
-        self._agents('node1')
-        route = self._attach(_route('p1'))[0]
-        self.assertEqual([E3], route['segments'])
-        self.assertEqual({'node1': []}, route['segments_by_source'])
-
-    def test_a_dead_destination_does_not_unsteer_its_path(self):
-        # Its VMs are gone with it; nothing to reroute.
-        self._paths(by_host={'node2': ['node3']})
-        self._agents('node2')
-        self.assertEqual([E3], self._attach(_route('p1'))[0]['segments'])
 
     def test_a_domain_with_no_path_costs_no_agent_query(self):
         self._agents('node1')
@@ -1026,17 +799,6 @@ class TestDeadWaypoint(TePluginTestCaseBase):
         self.assertEqual('DEGRADED', path['status'])
         self.assertEqual([], path['segments'])
         self.assertEqual([], path['encoded_segments'])
-
-    def test_the_path_reports_active_once_the_node_is_back(self):
-        path = self.plugin._resolve_te_path(
-            self.ctx, self._path(), self.locators, 7, frozenset())
-        self.assertEqual('ACTIVE', path['status'])
-
-    def test_a_dead_destination_or_source_does_not_degrade_the_path(self):
-        path = self.plugin._resolve_te_path(
-            self.ctx, self._path(source_host='node3'), self.locators, 7,
-            frozenset({'node2', 'node3'}))
-        self.assertEqual('ACTIVE', path['status'])
 
     def test_listing_resolves_against_one_liveness_query(self):
         self.te_db.get_all_te_paths.return_value = [
@@ -1125,8 +887,8 @@ class TestFabricLocators(TePluginTestCaseBase):
 
     def test_a_fabric_node_is_a_usable_waypoint(self):
         self.assertEqual(['fc00:0:c1:fff0::', 'fc00:0:1:fff0::'],
-                         self.plugin._transit_sids(['s1', 'node1'],
-                                                   dict(self.locators)))
+                         self.plugin._resolver(dict(self.locators)).transit(
+                             ['s1', 'node1']))
 
     def test_the_payload_carries_fabric_locators_registered_hosts_win(self):
         self.core.get_network.return_value = {'subnets': [], 'mtu': 1450}

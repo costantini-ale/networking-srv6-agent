@@ -469,8 +469,7 @@ class PluginUnitTestCaseBase(base.BaseTestCase):
         self.link_state_db.get_last_seen.return_value = {}
         self.link_state_db.get_link_states.return_value = []
         self.core.get_agents.return_value = []
-        self.te_db.get_te_paths_for_domain.return_value = {'by_port': {},
-                                                           'by_host': {}}
+        self.te_db.get_te_paths.return_value = []
         self.te_db.delete_auto_paths_of_port.return_value = []
         self.te_db.get_domain_ids_for_source_port.return_value = []
         self.plugin = plugin.Srv6Plugin()

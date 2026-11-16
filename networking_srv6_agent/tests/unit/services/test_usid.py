@@ -106,60 +106,15 @@ class TestPayloadAndPaths(UsidPluginTestCaseBase):
             self.ctx, test_plugin._domain())
         self.assertEqual('usid', payload['encoding'])
 
-    def test_transit_sids_are_un(self):
-        self.assertEqual(['fc00:0:3::', 'fc00:0:1::'],
-                         self.plugin._transit_sids(['node3', 'node1'],
-                                                   LOCATORS))
-
-    def test_a_path_shows_its_container(self):
-        path = self.plugin._resolve_te_path(
-            self.ctx, test_te._db_path(destination_host='node2',
-                                       via_hosts=['node3', 'node1']),
-            LOCATORS, 0xe005)
-        self.assertEqual(['fc00:0:3::', 'fc00:0:1::', 'fc00:0:2:e005::'],
-                         path['segments'])
-        self.assertEqual(['fc00:0:3:1:2:e005::'], path['encoded_segments'])
-
-    def test_a_source_entry_is_un(self):
-        self.te_db.get_te_paths_for_domain.return_value = {
-            'by_port': {}, 'by_host': {},
-            'by_source': {'node1': {'by_port': {},
-                                    'by_host': {'node2': ['node3']}}}}
-        route = self.plugin._attach_segments(
-            self.ctx, 'd1', [test_te._route('p1')], LOCATORS)[0]
-        self.assertEqual({'node1': ['fc00:0:3::']},
-                         route['segments_by_source'])
-
-    def test_a_source_path_container_leaves_out_the_source(self):
-        # Ingress node1, first waypoint node1: its uN is dropped, so the
-        # container starts at node3.
-        path = self.plugin._resolve_te_path(
-            self.ctx, test_te._db_path(destination_host='node2',
-                                       source_host='node1',
-                                       via_hosts=['node1', 'node3']),
-            LOCATORS, 0xe005)
-        self.assertEqual(['fc00:0:3:2:e005::'], path['encoded_segments'])
-
-    def test_a_degraded_path_pushes_nothing(self):
-        path = self.plugin._resolve_te_path(
-            self.ctx, test_te._db_path(destination_host='nowhere'),
-            LOCATORS, 0xe005)
-        self.assertEqual(([], []), (path['segments'],
-                                    path['encoded_segments']))
+    def test_the_resolver_gets_the_encoding(self):
+        # the microSID cases themselves are in test_te_resolver
+        self.assertEqual(['fc00:0:3::'], self.plugin._resolver(
+            LOCATORS).transit(['node3']))
 
 
 class TestFullSidPaths(UsidPluginTestCaseBase):
 
     encoding = 'encap'
-
-    def test_encoded_is_the_same_list(self):
-        path = self.plugin._resolve_te_path(
-            self.ctx, test_te._db_path(destination_host='node2',
-                                       via_hosts=['node1']),
-            LOCATORS, 0xe007)
-        self.assertEqual(['fc00:0:1:fff0::', 'fc00:0:2:e007::'],
-                         path['encoded_segments'])
-        self.assertEqual(path['segments'], path['encoded_segments'])
 
     def test_full_sids_need_no_capability(self):
         with mock.patch.object(plugin, 'LOG') as log:

@@ -157,9 +157,9 @@ class TestAutoPathGuard(SourcePortTestCase):
 class TestPayload(SourcePortTestCase):
 
     def _attach(self, by_source_port, *routes):
-        self.te_db.get_te_paths_for_domain.return_value = {
-            'by_port': {}, 'by_host': {}, 'by_source': {},
-            'by_source_port': by_source_port}
+        self.te_db.get_te_paths.return_value = test_te._rows(
+            by_source_port={vm: (maps['by_port'], maps['by_host'])
+                            for vm, maps in by_source_port.items()})
         routes = [dict(r) for r in routes]
         self.plugin._attach_segments(self.ctx, 'd1', routes,
                                      dict(self.locators))

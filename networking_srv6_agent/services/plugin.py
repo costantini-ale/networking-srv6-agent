@@ -77,6 +77,7 @@ from networking_srv6_agent.services import pce
 from networking_srv6_agent.services import rpc
 from networking_srv6_agent.services import te_liveness
 from networking_srv6_agent.services import te_reopt
+from networking_srv6_agent.services import te_resolver
 
 
 LOG = logging.getLogger(__name__)
@@ -1072,195 +1073,39 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                           "treating every fabric node as alive")
         return frozenset(dead)
 
-    def _transit_sids(self, via_hosts, locators, dead_hosts=()):
-        """The transit SIDs of via_hosts in order, or None if one is unusable.
-
-        A host is unusable when it has no registered locator or when its
-        node is dead (dead_hosts, see _dead_hosts): a dead waypoint
-        blackholes the path exactly as a missing one cannot be encoded.
-
-        Each host's End SID, <locator>:fff0::, or in usid mode its uN, the
-        locator's own address -- the agent packs those into containers.
-
-        None, not a shorter list: a path missing a waypoint is not the path
-        the admin asked for, and quietly dropping a hop is the silent
-        partial steering the locator API exists to prevent. The caller
-        falls back to the direct route instead, and the path reports
-        DEGRADED.
-
-        A host with no registered locator may be a fabric node of the
-        topology file (a spine or leaf, which runs no agent): its locator
-        comes from there.
-        """
-        locators = {**self.fabric_locators, **locators}
-        if any(not locators.get(host) or host in dead_hosts
-               for host in via_hosts):
-            return None
-        if self.usid:
-            try:
-                return [sid.node_sid(locators[host]) for host in via_hosts]
-            except sid.InvalidLocator as e:
-                LOG.error("SRv6: a via host's locator is not usable for "
-                          "microSID: %s", e)
-                return None
-        return [sid.format_sid(locators[host],
-                               constants.NODE_END_FUNCTION_ID)
-                for host in via_hosts]
-
-    def _route_transit(self, domain_id, route, by_port, by_host, locators,
-                       source=None, dead_hosts=()):
-        """The transit SIDs one set of paths gives a route, or None.
-
-        by_port and by_host are the paths of one rank pair: the any-source
-        paths, or the paths of one source. Port path > host path, and a
-        port path with no vias is an explicit "direct" that still wins
-        over a host path.
-
-            None   no path of this set applies to the route
-            []     a path applies and says direct: no vias, or DEGRADED (a
-                   via host has no registered locator or its node is dead,
-                   or the source has no registered locator).
-                   Degraded is direct, not "fall through to the next path
-                   down", which the admin did not ask for either.
-            [...]  the transit SIDs, in traversal order
-        """
-        via_hosts = by_port.get(route.get('port_id'))
-        if via_hosts is None:
-            via_hosts = by_host.get(route.get('host'))
-        if via_hosts is None:
-            return None
-        if not via_hosts:
-            return []
-        transit = None
-        if source is None or locators.get(source):
-            transit = self._transit_sids(via_hosts, locators, dead_hosts)
-        if transit is None:
-            LOG.warning("SRv6 domain %(d)s: the TE path toward %(p)s%(s)s "
-                        "names a host with no registered locator or a dead "
-                        "node (via %(v)s, dead: %(x)s); routing it directly",
-                        {'d': domain_id, 'p': route['prefix'],
-                         's': ' from %s' % source if source else '',
-                         'v': ', '.join(via_hosts),
-                         'x': ', '.join(sorted(
-                             set(via_hosts) & set(dead_hosts))) or 'none'})
-            return []
-        return transit
+    def _resolver(self, locators, dead_hosts=frozenset()):
+        return te_resolver.Resolver(locators, self.fabric_locators,
+                                    dead_hosts, self.usid)
 
     def _attach_segments(self, admin_context, domain_id, routes, locators,
                          dead_hosts=None):
-        """Give each steered route its transit SIDs. Mutates `routes`.
+        """Give each steered route its transit SIDs (Resolver.attach).
 
-        One payload goes to every node, so a route carries the answer for
-        every ingress at once:
-
-            segments             the any-source answer: what every ingress
-                                 pushes unless it has an entry below
-            segments_by_source   {source host: transit SIDs}, one entry per
-                                 source whose paths apply to the route;
-                                 the agent of that host uses it instead
-
-        Precedence per route and ingress, highest first:
-
-            (port, source) > (host, source) > (port, any) > (host, any)
-            > direct
-
-        The two source ranks live in segments_by_source, the two any-source
-        ranks in segments; the agent's choice of its own entry over
-        `segments` is what puts every source path above every any-source
-        path. An entry may be [] -- an explicit or degraded "direct from
-        this source" -- and must still be sent, or that ingress would fall
-        back to `segments`.
-
-        A source that is the route's own host gets no entry: that node never
-        encapsulates its own VMs' traffic (the agent skips the route). Both
-        keys are added only when non-empty, so a route nothing steers stays
-        byte-for-byte the plain route.
-
-        Transit SIDs only: the agent appends the decap SID, from the locator
-        of the route's host, as it always has.
-
-        dead_hosts is what _dead_hosts returned; None asks it here, after the
-        no-paths return, so a domain with no TE path costs no agent query.
-        A path through a dead host is direct, like one through an unknown
-        host: [] for every route it covers.
+        Reads what the resolver needs: the domain's paths, and the binding
+        of each source VM a path names. dead_hosts is what _dead_hosts
+        returned; None asks it here, after the no-paths return, so a domain
+        with no TE path costs no agent query.
         """
-        paths = te_db.get_te_paths_for_domain(admin_context, domain_id)
-        by_port, by_host = paths['by_port'], paths['by_host']
-        by_source = paths.get('by_source') or {}
-        by_source_port = paths.get('by_source_port') or {}
-        # by_source too: a domain whose only paths name a source must not
-        # leave here unsteered.
-        if not by_port and not by_host and not by_source and \
-                not by_source_port:
+        paths = te_db.get_te_paths(admin_context, domain_id)
+        if not paths:
             return routes
         if dead_hosts is None:
             dead_hosts = self._dead_hosts(admin_context)
-        for route in routes:
-            transit = self._route_transit(domain_id, route, by_port, by_host,
-                                          locators, dead_hosts=dead_hosts)
-            if transit:
-                route['segments'] = transit
-            per_source = {}
-            for source in sorted(by_source):
-                if source == route.get('host'):
-                    continue
-                transit = self._route_transit(
-                    domain_id, route, by_source[source]['by_port'],
-                    by_source[source]['by_host'], locators, source=source,
-                    dead_hosts=dead_hosts)
-                if transit is not None:
-                    per_source[source] = transit
-            if per_source:
-                route['segments_by_source'] = per_source
-        if by_source_port:
-            self._attach_source_port_segments(
-                admin_context, domain_id, routes, by_source_port, locators,
-                dead_hosts)
-        return routes
-
-    def _attach_source_port_segments(self, admin_context, domain_id, routes,
-                                     by_source_port, locators, dead_hosts):
-        """Give each route its source-VM paths. Mutates `routes`.
-
-        route['segments_by_source_port'] = {source port id: {
-            'host': the node it is bound to (the only agent that acts),
-            'network_id': its network (whose gateway port the rule names),
-            'prefixes': its fixed IPs, as /32 or /128 (the rule's `from`),
-            'segments': transit SIDs; [] is "direct for this VM"}}
-
-        Ranks within a source VM: its path to the route's port > its path
-        to the route's host (_route_transit). A source VM that is unbound,
-        gone, or on a node without a locator gets no entry: its traffic
-        follows the other ranks. Nor does a route toward the VM's own node,
-        whose traffic is never encapsulated there.
-        """
         vms = {}
-        for port_id in sorted(by_source_port):
+        for port_id in sorted({p[te_def.SOURCE_PORT_ID] for p in paths
+                               if p.get(te_def.SOURCE_PORT_ID)}):
             try:
                 port = self._core_plugin().get_port(admin_context, port_id)
             except n_exc.PortNotFound:
                 continue
-            host = port.get(portbindings.HOST_ID)
-            if not host or not locators.get(host):
-                continue
             vms[port_id] = {
-                'host': host, 'network_id': port.get('network_id'),
+                'host': port.get(portbindings.HOST_ID),
+                'network_id': port.get('network_id'),
                 'prefixes': [_prefix_for(f['ip_address'])
                              for f in port.get('fixed_ips') or []
                              if f.get('ip_address')]}
-        for route in routes:
-            per_vm = {}
-            for port_id, vm in vms.items():
-                if vm['host'] == route.get('host'):
-                    continue
-                maps = by_source_port[port_id]
-                transit = self._route_transit(
-                    domain_id, route, maps['by_port'], maps['by_host'],
-                    locators, source=vm['host'], dead_hosts=dead_hosts)
-                if transit is not None:
-                    per_vm[port_id] = dict(vm, segments=transit)
-            if per_vm:
-                route['segments_by_source_port'] = per_vm
+        return self._resolver(locators, dead_hosts).attach(
+            domain_id, routes, paths, vms)
 
     def _destination_of(self, admin_context, path):
         """The compute host a path's traffic is headed for, or None."""
@@ -1275,68 +1120,14 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
 
     def _resolve_te_path(self, context, path, locators, function_id,
                          dead_hosts=()):
-        """Attach `segments` and `status` -- what the server resolved.
-
-        ACTIVE:   [<via End SIDs>..., <destination decap SID>]
-        DEGRADED: [], because a via host or the destination has no locator,
-                  a via host's node is dead (dead_hosts), or the port is
-                  unbound; the routes go direct meanwhile.
-                  For a path with a source_host, also when the source has
-                  no locator, or the destination is the source itself (a
-                  port path whose VM has moved onto it): its agent never
-                  encapsulates traffic to its own VMs, so the path steers
-                  nothing.
-
-        For a path with a source_host the source is the only ingress, so
-        `segments` leaves out leading SIDs of that node, exactly as its
-        agent drops them: the list shown is the list pushed.
-
-        `encoded_segments` is what the ingress will actually push: the
-        same list with full SIDs, the C-SID containers in usid mode --
-        computed by the same sid.encode the agent calls, so the two cannot
-        disagree. The leading-SID drop is sid.drop_leading, the agent's too.
-
-        Server resolution, not an agent acknowledgement: ACTIVE says the
-        payload carries this list, not that any kernel holds it.
-        """
-        path = dict(path)
-        source = path.get(te_def.SOURCE_HOST)
-        source_port_id = path.get(te_def.SOURCE_PORT_ID)
-        if source_port_id:
-            # the node the VM is bound to now: the path follows it
-            source = self._destination_of(
-                context.elevated(),
-                {te_def.DESTINATION_PORT_ID: source_port_id})
-        destination = self._destination_of(context.elevated(), path)
-        transit = self._transit_sids(path[te_def.VIA_HOSTS], locators,
-                                     dead_hosts)
-        active = bool(destination and locators.get(destination) and
-                      transit is not None and function_id is not None)
-        if active and source_port_id and not source:
-            active = False                  # the source VM is unbound
-        if active and source:
-            active = bool(locators.get(source)) and destination != source
-        if active:
-            own = self._transit_sids([source], locators) if source else None
-            if own:
-                transit = sid.drop_leading(transit, own[0])
-            segments = transit + [
-                sid.format_sid(locators[destination], function_id)]
-            path[te_def.SEGMENTS] = segments
-            path[te_def.ENCODED_SEGMENTS] = sid.encode(segments, self.usid)
-            path[te_def.STATUS] = te_def.STATUS_ACTIVE
-            return path
-        LOG.warning("SRv6 TE path %(id)s is DEGRADED: destination %(dst)s, "
-                    "source %(src)s, via %(via)s; not every host on it has "
-                    "a registered locator or is dead, the port is unbound, "
-                    "or the destination is the source itself, so its "
-                    "routes go direct", {'id': path['id'], 'dst': destination,
-                                         'src': source or 'any',
-                                         'via': path[te_def.VIA_HOSTS]})
-        path[te_def.SEGMENTS] = []
-        path[te_def.ENCODED_SEGMENTS] = []
-        path[te_def.STATUS] = te_def.STATUS_DEGRADED
-        return path
+        """Resolver.resolve, with the bindings of the path's ports read."""
+        bindings = {
+            port_id: self._destination_of(
+                context.elevated(), {te_def.DESTINATION_PORT_ID: port_id})
+            for port_id in (path.get(te_def.DESTINATION_PORT_ID),
+                            path.get(te_def.SOURCE_PORT_ID)) if port_id}
+        return self._resolver(locators, dead_hosts).resolve(
+            path, function_id, bindings)
 
     def _resolved(self, context, path, locators=None):
         admin_context = context.elevated()
