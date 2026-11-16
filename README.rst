@@ -199,13 +199,4 @@ Changing ``dataplane_encoding`` requires a deployment with no domains:
 restart the server, then the agents.
 
 
-Development
------------
-
-::
-
-    tox -e py3          # unit tests
-    tox -e pep8         # flake8
-    tox -e dashboard    # Horizon panel tests
-
 License: Apache 2.0.
