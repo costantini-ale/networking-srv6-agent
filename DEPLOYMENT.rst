@@ -21,7 +21,7 @@ Requirements
 - An **IPv6-routable underlay** between all nodes: each node's locator must
   be reachable from every other node. With ``usid`` all locators are /48 in
   one /32 block. The underlay is yours to build; the plugin only uses it.
-- Python >= 3.11, Neutron of the same release.
+- Python >= 3.11; Neutron from the same OpenStack release as DevStack.
 
 Each node has a **locator**, a unique IPv6 prefix such as ``fc00:0:1::/48``.
 A domain's SID on that node is the locator plus the domain's function id.
@@ -82,20 +82,51 @@ node3    10.0.0.13        fd00::3/64       ``fc00:0:3::/48``
 1. Underlay
 ~~~~~~~~~~~
 
-On each host, an underlay address on the shared NIC (here ``eth0``) and a
-route to every other host's locator. On ``node1``::
+On each host, the ``vrf`` kernel module, an underlay address on the shared
+NIC (``eth0`` here; use your NIC's name, e.g. ``enp1s0``) and a route to
+every other host's locator. On ``node1``::
 
+    sudo apt-get install -y linux-modules-extra-$(uname -r)   # vrf module
     sudo ip -6 addr add fd00::1/64 dev eth0
     sudo ip -6 route add fc00:0:2::/48 via fd00::2
     sudo ip -6 route add fc00:0:3::/48 via fd00::3
 
 and the same on ``node2`` and ``node3`` with their own address and the two
-other locators. Make these persistent with your distribution's network
-configuration. Check from every host before stacking: ``ping -6 fd00::2``
-and so on. The agent sets the SRv6 sysctls (``seg6_enabled``, forwarding)
-itself.
+other locators. These commands do not survive a reboot. On Ubuntu, make them
+persistent with a netplan file, ``/etc/netplan/60-underlay.yaml`` (mode
+600, then ``sudo netplan apply``)::
 
-2. local.conf on node1 (controller)
+    network:
+      version: 2
+      ethernets:
+        eth0:
+          addresses: ["fd00::1/64"]
+          routes:
+            - {to: "fc00:0:2::/48", via: "fd00::2"}
+            - {to: "fc00:0:3::/48", via: "fd00::3"}
+
+The key under ``ethernets`` must match the one in your existing netplan
+file (cloud images often use another id than the NIC name). Check from every
+host before stacking: ``ping -6 fd00::2`` and so on. The agent loads ``vrf``
+and sets the SRv6 sysctls (``seg6_enabled``, forwarding) itself.
+
+2. DevStack
+~~~~~~~~~~~
+
+On each host, a ``stack`` user with passwordless sudo, and DevStack cloned
+into its home::
+
+    sudo useradd -s /bin/bash -d /opt/stack -m stack
+    sudo chmod +x /opt/stack
+    echo "stack ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/stack
+    sudo -u stack -i
+    git clone https://opendev.org/openstack/devstack -b stable/2026.2
+    cd devstack
+
+The ``local.conf`` below goes in this ``devstack`` directory, and every
+following command runs as ``stack``.
+
+3. local.conf on node1 (controller)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
@@ -120,7 +151,7 @@ itself.
     enable_plugin networking-srv6-agent https://github.com/costa99/networking-srv6-agent.git main
     SRV6_LOCATOR=fc00:0:1::/48
 
-3. local.conf on node2 and node3 (computes)
+4. local.conf on node2 and node3 (computes)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 On ``node2`` (``node3``: ``HOST_IP=10.0.0.13``,
@@ -149,19 +180,20 @@ On ``node2`` (``node3``: ``HOST_IP=10.0.0.13``,
     enable_plugin networking-srv6-agent https://github.com/costa99/networking-srv6-agent.git main
     SRV6_LOCATOR=fc00:0:2::/48
 
-4. Stack
+5. Stack
 ~~~~~~~~
 
 Run ``./stack.sh`` on ``node1`` first, then on ``node2`` and ``node3``. Then,
 on ``node1``, register the new computes::
 
-    source devstack/openrc admin admin
+    source ~/devstack/openrc admin admin
     nova-manage cell_v2 discover_hosts
 
-5. Check it
+6. Check it
 ~~~~~~~~~~~
 
-The control plane, on ``node1``::
+Everything below runs on ``node1`` as ``stack``, in a shell where
+``~/devstack/openrc admin admin`` is sourced. The control plane::
 
     openstack network agent list --agent-type open-vswitch   # 3 hosts, alive
     openstack srv6 locator list                             # one per host
@@ -185,6 +217,7 @@ Two networks in one domain, with a VM on each, on two different hosts::
         --network net-a --availability-zone nova:node1 vm-a
     openstack server create --image $image --flavor m1.tiny \
         --network net-b --availability-zone nova:node2 vm-b
+    openstack server list        # wait for ACTIVE; note both addresses
 
 A domain network has no router, so no floating IP. To reach ``vm-a``, use
 SSH from its network's DHCP namespace on ``node1`` (cirros password:
@@ -198,10 +231,13 @@ The SRv6 state behind it, on ``node1``::
 
     ip -br link show type vrf                     # one VRF for domain red
     ip -6 route show table all | grep seg6local   # red's SID: decap into it
-    ip route show table all | grep seg6           # vm-b's route: encap to node2
+    ip route show table all | grep 'encap seg6 '  # vm-b's route: encap to node2
 
 Expect one VRF, one ``End.DT46`` route on ``fc00:0:1:...``, and a route to
-``vm-b``'s address that is encapsulated toward a SID in ``fc00:0:2::/48``.
+``vm-b``'s address that is encapsulated toward a SID in ``fc00:0:2::/48``
+(``mode encap.red``). The ``seg6local`` list also shows the node's own
+``End`` routes, on the locator and on ``fc00:0:1:fff0::``: they are always
+there, one per node, not per domain.
 A TE path through ``node3`` (``openstack srv6 te path create --domain red
 --destination-host node2 --via-host node3``) adds ``node3``'s SID to that
 route, and the ping still works.

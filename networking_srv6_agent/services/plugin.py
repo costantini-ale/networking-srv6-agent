@@ -72,25 +72,24 @@ from networking_srv6_agent.services import rpc
 from networking_srv6_agent.services import te_liveness
 from networking_srv6_agent.services import te_resolver
 from networking_srv6_agent.services.underlay import telemetry
+from networking_srv6_agent.services import workload
 
 
 LOG = logging.getLogger(__name__)
 
 
-def _prefix_for(address):
-    return '%s/%d' % (address, 128 if ':' in address else 32)
+def _routes_of(endpoint):
+    """An endpoint's payload routes, one per address.
 
-
-def _route_for(port, address, host):
-    """One payload route. The full sync and the incremental path share it.
-
-    network_id is for the agent's per-route MTU check;
-    port_id is what per-VM TE precedence resolves on.
+    The full sync and the incremental path share it. network_id is for the
+    agent's per-route MTU check; port_id is what per-VM TE precedence
+    resolves on.
     """
-    return {'prefix': _prefix_for(address),
-            'host': host,
-            'port_id': port['id'],
-            'network_id': port.get('network_id')}
+    return [{'prefix': prefix,
+             'host': endpoint.host,
+             'port_id': endpoint.port_id,
+             'network_id': endpoint.network_id}
+            for prefix in endpoint.prefixes]
 
 
 def _normalise_filters(filters):
@@ -251,6 +250,21 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
             'subnets': subnets,
         }
 
+    def _workload_endpoints(self, context, network_ids):
+        """The workload endpoints on these networks, live-migrating included.
+
+        A port DOWN in the middle of a live migration keeps its route: a
+        resync in that window must not prune it everywhere.
+        """
+        if not network_ids:
+            return []
+        ports = self._core_plugin().get_ports(
+            context, filters={'network_id': list(network_ids)})
+        migrating = srv6_db.get_migrating_port_ids(
+            context, [p['id'] for p in ports
+                      if p.get('status') != n_const.PORT_STATUS_ACTIVE])
+        return workload.endpoints(ports, migrating)
+
     def _routes_for_domain(self, context, network_ids, locators):
         """One route per port that is bound to a host with a known locator.
 
@@ -260,47 +274,15 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
         per-VM TE precedence resolves on it -- and its network_id. TE
         segments are attached afterwards, by _attach_segments.
         """
-        if not network_ids:
-            return []
-        plugin = self._core_plugin()
         routes = []
-        ports = plugin.get_ports(
-            context, filters={'network_id': list(network_ids)})
-        # A port DOWN in the middle of a live migration keeps its route:
-        # a resync in that window must not prune it everywhere.
-        migrating = srv6_db.get_migrating_port_ids(
-            context, [p['id'] for p in ports
-                      if p.get('status') != n_const.PORT_STATUS_ACTIVE])
-        for port in ports:
-            if not self._port_is_relevant(port, port['id'] in migrating):
-                continue
-            host = port.get(portbindings.HOST_ID) or port.get('host')
-            if not host:
-                continue
-            if not locators.get(host):
+        for ep in self._workload_endpoints(context, network_ids):
+            if not locators.get(ep.host):
                 LOG.debug("skipping port %(p)s: host %(h)s has not "
                           "registered an SRv6 locator yet",
-                          {'p': port['id'], 'h': host})
+                          {'p': ep.port_id, 'h': ep.host})
                 continue
-            for fixed_ip in port.get('fixed_ips', []):
-                address = fixed_ip.get('ip_address')
-                if not address:
-                    continue
-                routes.append(_route_for(port, address, host))
+            routes.extend(_routes_of(ep))
         return routes
-
-    @staticmethod
-    def _port_is_relevant(port, migrating=False):
-        """Only real, bound, up workload ports carry tenant traffic.
-
-        A live-migrating port is up although its status says DOWN: the VM
-        runs on its source until the move, then on the destination.
-        """
-        device_owner = port.get('device_owner', '')
-        if device_owner.startswith(n_const.DEVICE_OWNER_NETWORK_PREFIX):
-            # DHCP, router and other infrastructure ports are not workloads.
-            return False
-        return migrating or port.get('status') == n_const.PORT_STATUS_ACTIVE
 
     def _build_domain_payload(self, context, domain, locators=None,
                               dead_hosts=None):
@@ -690,25 +672,14 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
     def domain_addresses(self, admin_context, domain):
         """{address: (port id, host)} of a domain's bound workload ports.
 
-        The same ports _routes_for_domain advertises (_port_is_relevant),
-        whatever the host's locator: the measurement already shows where
-        the traffic is.
+        The same endpoints _routes_for_domain advertises, live-migrating
+        ports included, whatever the host's locator: the measurement
+        already shows where the traffic is.
         """
-        network_ids = domain.get(srv6_def.NETWORKS) or []
-        if not network_ids:
-            return {}
-        out = {}
-        for port in self._core_plugin().get_ports(
-                admin_context, filters={'network_id': list(network_ids)}):
-            host = port.get(portbindings.HOST_ID) or port.get('host')
-            if not host or not self._port_is_relevant(port):
-                continue
-            for fixed_ip in port.get('fixed_ips', []):
-                address = fixed_ip.get('ip_address')
-                if address:
-                    out[str(ipaddress.ip_address(address))] = (port['id'],
-                                                               host)
-        return out
+        return {prefix.split('/')[0]: (ep.port_id, ep.host)
+                for ep in self._workload_endpoints(
+                    admin_context, domain.get(srv6_def.NETWORKS) or [])
+                for prefix in ep.prefixes}
 
     def get_srv6_aggregate_loads(self, context, filters=None, fields=None,
                                  sorts=None, limit=None, marker=None,
@@ -841,24 +812,25 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                 port = self._core_plugin().get_port(admin_context, port_id)
             except n_exc.PortNotFound:
                 continue
-            vms[port_id] = {
-                'host': port.get(portbindings.HOST_ID),
-                'network_id': port.get('network_id'),
-                'prefixes': [_prefix_for(f['ip_address'])
-                             for f in port.get('fixed_ips') or []
-                             if f.get('ip_address')]}
+            # The host and address rules of its own route; a stopped or
+            # migrating source VM keeps its binding.
+            ep = workload.endpoint(port, workload_only=False)
+            if ep:
+                vms[port_id] = {'host': ep.host,
+                                'network_id': ep.network_id,
+                                'prefixes': list(ep.prefixes)}
         return self._resolver(locators, dead_hosts).attach(
             domain_id, routes, paths, vms)
 
     def host_of_port(self, admin_context, port_id):
-        """The compute host a port is bound to, or None."""
+        """The node a port is bound to (the routes' host rule), or None."""
         if not port_id:
             return None
         try:
             port = self._core_plugin().get_port(admin_context, port_id)
         except n_exc.PortNotFound:
             return None
-        return port.get(portbindings.HOST_ID) or None
+        return workload.host_of(port)
 
     def _resolve_te_path(self, context, path, locators, function_id,
                          dead_hosts=()):
@@ -1170,46 +1142,29 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
     # ------------------------------------------------------------------
     # port events -- the incremental path
     # ------------------------------------------------------------------
-    def _notify_port(self, context, port, removed=False, migrating=False,
-                     first_host=None):
-        """Advertise or withdraw a port's routes on every node.
+    def _notify_port(self, context, ep, removed=False, first_host=None):
+        """Advertise or withdraw an endpoint's routes on every node.
 
         first_host gets the add before everybody else and is waited for
         (bounded): the live-migration handover, where the new node must
         stop routing the address back to the old one before any node sends
         it there, or the two loop.
         """
-        if not port:
-            return
-        network_id = port.get('network_id')
-        if not network_id:
-            return
-        # The full payload's rule (_routes_for_domain): a DHCP or router
-        # port is never advertised. Without it an incremental add put a
-        # route on every node that the next full sync took away again.
-        # Removals pass: withdrawing a route nobody holds is harmless.
-        if not removed and not self._port_is_relevant(port, migrating):
+        if not ep or not ep.network_id or not ep.prefixes:
             return
         # Runs on every port update in the cloud: one indexed query, and an
         # early return for the common case of a network in no domain.
         domain_ids = domain_db.get_domain_ids_for_network(
-            context.elevated(), network_id)
+            context.elevated(), ep.network_id)
         if not domain_ids:
             return
-        host = port.get(portbindings.HOST_ID) or port.get('host')
-        if not host:
-            return
         locators = srv6_db.get_host_locators(context.elevated())
-        if host not in locators and not removed:
+        if ep.host not in locators and not removed:
             LOG.debug("port %(p)s is on host %(h)s which has no SRv6 "
                       "locator; not advertising it",
-                      {'p': port['id'], 'h': host})
+                      {'p': ep.port_id, 'h': ep.host})
             return
-        routes = [_route_for(port, fixed_ip['ip_address'], host)
-                  for fixed_ip in port.get('fixed_ips', [])
-                  if fixed_ip.get('ip_address')]
-        if not routes:
-            return
+        routes = _routes_of(ep)
         for domain_id in domain_ids:
             if srv6_db.get_function_id(context.elevated(), domain_id) is None:
                 continue
@@ -1227,35 +1182,6 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                     self.agent_rpc.routes_updated_on_host(
                         context, first_host, domain_id, add=add)
                 self.agent_rpc.routes_updated(context, domain_id, add=add)
-
-    @staticmethod
-    def _addresses(port):
-        return {fixed_ip['ip_address']
-                for fixed_ip in (port or {}).get('fixed_ips') or []
-                if fixed_ip.get('ip_address')}
-
-    def _notify_fixed_ip_change(self, context, original, port):
-        """A live port that kept its host but changed addresses.
-
-        None of the status or host branches matches this case, so until the
-        next periodic resync (300 s) other nodes had no route to an added
-        address and kept one to a removed address. Only the difference is
-        sent, removals first, as for a move: an address that stayed is not
-        touched, and between the two messages no node routes an address that
-        has left the port.
-        """
-        old, new = self._addresses(original), self._addresses(port)
-        if old == new:
-            return
-        left = [f for f in original.get('fixed_ips') or []
-                if f.get('ip_address') in old - new]
-        added = [f for f in port.get('fixed_ips') or []
-                 if f.get('ip_address') in new - old]
-        if left:
-            self._notify_port(context, dict(original, fixed_ips=left),
-                              removed=True)
-        if added:
-            self._notify_port(context, dict(port, fixed_ips=added))
 
     def _source_vm_moved(self, context, port):
         """A VM changed node: end its auto paths, re-push its source paths.
@@ -1290,11 +1216,21 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                 LOG.exception("SRv6: could not push domain %s after port %s "
                               "moved", domain_id, port['id'])
 
-    @staticmethod
-    def _migrating(*ports):
-        """Nova marks a live migration with migrating_to in the profile."""
-        return any('migrating_to' in (p.get(portbindings.PROFILE) or {})
-                   for p in ports)
+    def _track_handover(self, context, original, port, first_host):
+        """Mark a handover before its RPC; drop the mark on a status change.
+
+        Full syncs read the mark (srv6_db.get_migrating_port_ids) through
+        the window where nova has deleted the source binding and the port
+        is not ACTIVE yet. Never raises: the handover must go ahead.
+        """
+        try:
+            if first_host:
+                srv6_db.mark_migrating(context.elevated(), port['id'])
+            elif original.get('status') != port.get('status'):
+                srv6_db.clear_migrating(context.elevated(), port['id'])
+        except Exception:
+            LOG.exception("SRv6: could not update the handover mark of "
+                          "port %s", port.get('id'))
 
     @registry.receives(resources.PORT, [events.AFTER_UPDATE])
     def registry_port_updated(self, resource, event, trigger, payload=None):
@@ -1305,41 +1241,11 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                 (port.get(portbindings.HOST_ID) or None)):
             self._source_vm_moved(context.elevated(), port)
         try:
-            was_active = original.get('status') == n_const.PORT_STATUS_ACTIVE
-            is_active = port.get('status') == n_const.PORT_STATUS_ACTIVE
-            old_host = original.get(portbindings.HOST_ID)
-            new_host = port.get(portbindings.HOST_ID)
-            if (old_host and new_host and old_host != new_host and
-                    not is_active and self._migrating(original, port)):
-                # Nova activated the destination binding: the VM runs
-                # there now and its port is wired (pre-plugged). Advertise
-                # it at once, new node first, instead of when the
-                # destination reports the port up 1-2 s later, by which
-                # time the old node may have dropped the network.
-                # The add also turns the old node's route into a pointer
-                # to the new node. The ACTIVE add later repeats it.
-                self._notify_port(context, port, migrating=True,
-                                  first_host=new_host)
-            elif is_active and not was_active:
-                self._notify_port(context, port)
-            elif was_active and not is_active:
-                if self._migrating(original, port):
-                    # Nova takes the port DOWN while the VM still runs on
-                    # its source; the add when it is ACTIVE on the
-                    # destination replaces the route in one step.
-                    LOG.debug("SRv6: port %s is live-migrating, route kept",
-                              port.get('id'))
-                else:
-                    self._notify_port(context, original, removed=True)
-            elif is_active:
-                # A live port that moved host: withdraw the old SID, then
-                # advertise the new one. Order matters -- the reverse would
-                # leave a window where two nodes claim the same address.
-                if old_host and new_host and old_host != new_host:
-                    self._notify_port(context, original, removed=True)
-                    self._notify_port(context, port)
-                else:
-                    self._notify_fixed_ip_change(context, original, port)
+            deltas, first_host = workload.classify(original, port)
+            self._track_handover(context, original, port, first_host)
+            for op, ep in deltas:
+                self._notify_port(context, ep, removed=op == workload.REMOVE,
+                                  first_host=first_host)
         except Exception:
             LOG.exception("SRv6: failed to process port update for %s",
                           port.get('id'))
@@ -1366,7 +1272,9 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
         context = payload.context
         port = payload.latest_state
         try:
-            self._notify_port(context, port, removed=True)
+            self._notify_port(
+                context, workload.endpoint(port, workload_only=False),
+                removed=True)
         except Exception:
             LOG.exception("SRv6: failed to process port delete for %s",
                           port.get('id'))

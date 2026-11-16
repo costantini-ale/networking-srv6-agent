@@ -542,19 +542,6 @@ class TestPortSelection(PluginUnitTestCaseBase):
         return self.plugin._routes_for_domain(self.ctx, ['net1'],
                                               self.locators)
 
-    def test_workload_port_is_relevant(self):
-        self.assertTrue(self.plugin._port_is_relevant(_port()))
-
-    def test_infrastructure_ports_are_not(self):
-        for owner in ('network:dhcp', 'network:router_interface',
-                      'network:router_gateway'):
-            self.assertFalse(
-                self.plugin._port_is_relevant(_port(device_owner=owner)))
-
-    def test_inactive_port_is_not(self):
-        self.assertFalse(self.plugin._port_is_relevant(
-            _port(status=n_const.PORT_STATUS_DOWN)))
-
     def test_route_for_an_ipv4_port_keeps_its_port_and_network(self):
         # port_id for per-VM TE precedence, network_id for the agent's
         # per-route MTU check.
@@ -819,7 +806,8 @@ class TestPortEvents(PortEventsTestCaseBase):
 
     def test_a_network_in_no_domain_costs_one_query_and_nothing_else(self):
         self.domain_db.get_domain_ids_for_network.return_value = []
-        self.plugin._notify_port(self.ctx, _port())
+        self.plugin.registry_port_deleted(None, None, None,
+                                          self._payload(_port()))
         self.srv6_db.get_host_locators.assert_not_called()
         self.agent_rpc.routes_updated.assert_not_called()
 
@@ -904,7 +892,8 @@ class TestPortEvents(PortEventsTestCaseBase):
 
     def test_a_domain_without_an_allocation_is_skipped(self):
         self.srv6_db.get_function_id.return_value = None
-        self.plugin._notify_port(self.ctx, _port())
+        self.plugin.registry_port_deleted(None, None, None,
+                                          self._payload(_port()))
         self.agent_rpc.routes_updated.assert_not_called()
 
     def test_a_failure_is_contained(self):
@@ -986,6 +975,119 @@ class TestFixedIpChange(PortEventsTestCaseBase):
             None, None, None,
             self._payload(port, dict(port, status=n_const.PORT_STATUS_DOWN)))
         self.agent_rpc.routes_updated.assert_not_called()
+
+
+class TestFullSyncParity(PortEventsTestCaseBase):
+    """The incremental path and one full sync agree on the routes.
+
+    Every routes_updated delta of a sequence of port events is applied to
+    a route table, which must then equal the routes of a full sync of the
+    final ports.
+    """
+
+    def _event(self, original, port):
+        self.plugin.registry_port_updated(None, None, None,
+                                          self._payload(port, original))
+
+    def _applied(self):
+        table = {}
+        for c in self.agent_rpc.routes_updated.call_args_list:
+            for r in c[1].get('remove', []):
+                table.pop(r['prefix'], None)
+            for r in c[1].get('add', []):
+                table[r['prefix']] = (r['host'], r['port_id'])
+        return table
+
+    def _full_sync(self, *ports):
+        self.core.get_ports.return_value = list(ports)
+        return {r['prefix']: (r['host'], r['port_id'])
+                for r in self.plugin._routes_for_domain(
+                    self.ctx, ['net1'], self.srv6_db.get_host_locators())}
+
+    def test_a_sequence_of_events_ends_where_a_full_sync_starts(self):
+        down = n_const.PORT_STATUS_DOWN
+        ips = TestFixedIpChange._ips
+        p1 = _port(status=down)
+        p2 = _port(status=down, fixed_ips=ips('10.0.0.6'))
+        dhcp = _port(status=down, device_owner='network:dhcp',
+                     fixed_ips=ips('10.0.0.2'))
+        p3 = _port(fixed_ips=ips('10.0.0.7'))
+        steps = [
+            (p1, dict(p1, status=n_const.PORT_STATUS_ACTIVE)),
+            (p2, dict(p2, status=n_const.PORT_STATUS_ACTIVE)),
+            (dhcp, dict(dhcp, status=n_const.PORT_STATUS_ACTIVE)),
+            (p3, dict(p3, **{portbindings.HOST_ID: 'node2'})),
+        ]
+        for original, port in steps:
+            self._event(original, port)
+        p1, p2, dhcp, p3 = (port for _, port in steps)
+        p1b = dict(p1, fixed_ips=ips('10.0.0.5', '10.0.0.21', 'FD98:1::21'))
+        p1c = dict(p1b, fixed_ips=ips('10.0.0.21', 'FD98:1::21'))
+        p2b = dict(p2, status=down)
+        for original, port in ((p1, p1b), (p1b, p1c), (p2, p2b)):
+            self._event(original, port)
+        self.assertEqual(self._full_sync(p1c, p2b, dhcp, p3),
+                         self._applied())
+
+
+class TestHandoverMark(PortEventsTestCaseBase):
+    """The server marks a handover until the port's next status change.
+
+    Between nova's binding activation and the port going ACTIVE on the
+    destination, the database holds no other sign of the migration; the
+    mark keeps the port in every full sync of that window.
+    """
+
+    def _update(self, original, port):
+        self.plugin.registry_port_updated(None, None, None,
+                                          self._payload(port, original))
+
+    def test_a_handover_is_marked_before_the_new_node_is_told(self):
+        port = _port(status=n_const.PORT_STATUS_DOWN,
+                     **{portbindings.HOST_ID: 'node2',
+                        portbindings.PROFILE: {}})
+        original = dict(port, **{portbindings.HOST_ID: 'node1',
+                                 portbindings.PROFILE: {
+                                     'migrating_to': 'node2'}})
+        calls = mock.Mock()
+        calls.attach_mock(self.srv6_db.mark_migrating, 'mark')
+        calls.attach_mock(self.agent_rpc.routes_updated_on_host, 'first')
+        self._update(original, port)
+        self.assertEqual(['mark', 'first'],
+                         [c[0] for c in calls.mock_calls])
+        self.assertEqual(port['id'],
+                         self.srv6_db.mark_migrating.call_args[0][1])
+        self.srv6_db.clear_migrating.assert_not_called()
+
+    def test_going_active_clears_the_mark(self):
+        port = _port()
+        self._update(dict(port, status=n_const.PORT_STATUS_DOWN), port)
+        self.assertEqual(port['id'],
+                         self.srv6_db.clear_migrating.call_args[0][1])
+
+    def test_a_withdrawal_clears_the_mark(self):
+        port = _port(status=n_const.PORT_STATUS_DOWN)
+        self._update(dict(port, status=n_const.PORT_STATUS_ACTIVE), port)
+        self.srv6_db.clear_migrating.assert_called_once_with(
+            mock.ANY, port['id'])
+
+    def test_an_update_without_a_status_change_touches_no_mark(self):
+        port = _port(fixed_ips=[{'ip_address': '10.0.0.6'}])
+        self._update(dict(port, fixed_ips=[{'ip_address': '10.0.0.5'}]),
+                     port)
+        self.srv6_db.mark_migrating.assert_not_called()
+        self.srv6_db.clear_migrating.assert_not_called()
+
+    def test_a_failing_mark_does_not_stop_the_handover(self):
+        self.srv6_db.mark_migrating.side_effect = RuntimeError('db gone')
+        port = _port(status=n_const.PORT_STATUS_DOWN,
+                     **{portbindings.HOST_ID: 'node2',
+                        portbindings.PROFILE: {}})
+        original = dict(port, **{portbindings.HOST_ID: 'node1',
+                                 portbindings.PROFILE: {
+                                     'migrating_to': 'node2'}})
+        self._update(original, port)
+        self.agent_rpc.routes_updated_on_host.assert_called_once()
 
 
 class TestSubnetGuard(PluginUnitTestCaseBase):

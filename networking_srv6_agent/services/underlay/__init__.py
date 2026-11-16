@@ -28,6 +28,6 @@ The underlay reaches the plugin only through these public plugin methods:
   auto TE path of one VM pair; None if a concurrent change won.
 - release_auto_path(ctx, path): delete one auto path; None if already gone.
 - domain_addresses(ctx, domain): {address: (port id, host)} of the
-  domain's bound workload ports.
+  domain's bound workload ports, live-migrating ones included.
 - usid: whether the dataplane encoding is uSID (a property).
 """

@@ -471,7 +471,7 @@ class TestPayloadCarriesTe(TePluginTestCaseBase):
 
 
 class TestIncrementalPathCarriesTe(TePluginTestCaseBase):
-    """_notify_port attaches segments too.
+    """The incremental path attaches segments too.
 
     Without them a steered VM's route arrives at depth 1 and stays so until
     the next full sync.
@@ -485,9 +485,15 @@ class TestIncrementalPathCarriesTe(TePluginTestCaseBase):
     def _added(self, call=0):
         return self.agent_rpc.routes_updated.call_args_list[call][1]['add']
 
+    def _activate(self):
+        self.plugin.registry_port_updated(
+            None, None, None,
+            mock.Mock(context=self.ctx, latest_state=self.port,
+                      states=[dict(self.port, status='DOWN')]))
+
     def test_a_steered_port_arrives_steered(self):
         self._paths(by_port={self.port['id']: ['node2']})
-        self.plugin._notify_port(self.ctx, self.port)
+        self._activate()
         self.assertEqual([{'prefix': '10.0.0.5/32', 'host': 'node2',
                            'port_id': self.port['id'], 'network_id': 'net1',
                            'segments': ['fc00:0:2:fff0::']}], self._added())
@@ -495,7 +501,7 @@ class TestIncrementalPathCarriesTe(TePluginTestCaseBase):
     def test_a_source_path_arrives_with_the_port(self):
         self._paths(by_source={'node1': ({self.port['id']: ['node3']},
                                          None)})
-        self.plugin._notify_port(self.ctx, self.port)
+        self._activate()
         self.assertEqual({'node1': [E3]},
                          self._added()[0]['segments_by_source'])
 
@@ -505,12 +511,14 @@ class TestIncrementalPathCarriesTe(TePluginTestCaseBase):
             lambda ctx, domain_id: _rows(
                 by_port={self.port['id']: ['node1']} if domain_id == 'd1'
                 else {})
-        self.plugin._notify_port(self.ctx, self.port)
+        self._activate()
         self.assertEqual(['fc00:0:1:fff0::'], self._added(0)[0]['segments'])
         self.assertNotIn('segments', self._added(1)[0])
 
     def test_a_withdrawal_needs_no_paths(self):
-        self.plugin._notify_port(self.ctx, self.port, removed=True)
+        self.plugin.registry_port_deleted(
+            None, None, None,
+            mock.Mock(context=self.ctx, latest_state=self.port))
         self.te_db.get_te_paths.assert_not_called()
         removed = self.agent_rpc.routes_updated.call_args[1]['remove']
         self.assertNotIn('segments', removed[0])

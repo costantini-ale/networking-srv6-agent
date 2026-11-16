@@ -38,6 +38,12 @@ SYNC_STATE = 'sync_state'
 # goes ahead unordered, as before.
 HANDOVER_CALL_TIMEOUT = 2
 
+# Seconds a live-migration handover mark keeps a DOWN port in full syncs.
+# The gap it covers (source binding deleted, port not yet ACTIVE on the
+# destination) is about a second; a migration that fails after the
+# activation leaves the port routed by full syncs at most this long.
+MIGRATION_MARK_TTL = 60
+
 # Every RPC payload carries this. An agent that receives a version it does
 # not understand logs and ignores rather than half-applying a message whose
 # shape it cannot rely on.

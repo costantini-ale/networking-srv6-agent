@@ -372,6 +372,23 @@ class TestDomainAddresses(test_plugin.PluginUnitTestCaseBase):
         self.core.get_ports.assert_called_once_with(
             self.ctx, filters={'network_id': ['net1']})
 
+    def test_a_live_migrating_port_stays_in_the_view(self):
+        # the full payload keeps its route: the view keeps the pair
+        moving = test_plugin._port(fixed_ips=[{'ip_address': '10.91.1.14'}],
+                                   status=n_const.PORT_STATUS_DOWN)
+        self.srv6_db.get_migrating_port_ids.return_value = {moving['id']}
+        self.core.get_ports.return_value = [moving]
+        self.assertEqual({'10.91.1.14': (moving['id'], 'node1')},
+                         self.plugin.domain_addresses(
+                             self.ctx, test_plugin._domain(networks=['net1'])))
+
+    def test_a_port_on_a_host_without_a_locator_stays_in_the_view(self):
+        port = test_plugin._port(**{portbindings.HOST_ID: 'node9'})
+        self.core.get_ports.return_value = [port]
+        self.assertEqual({'10.0.0.5': (port['id'], 'node9')},
+                         self.plugin.domain_addresses(
+                             self.ctx, test_plugin._domain(networks=['net1'])))
+
     def test_a_domain_without_networks_asks_nothing(self):
         self.assertEqual({}, self.plugin.domain_addresses(
             self.ctx, test_plugin._domain()))

@@ -17,6 +17,7 @@
 import datetime
 from unittest import mock
 
+from neutron.plugins.ml2 import models as ml2_models
 from neutron.tests import base
 from neutron.tests.unit import testlib_api
 from neutron_lib import context as n_context
@@ -24,8 +25,10 @@ from neutron_lib.db import api as db_api
 
 # The allocation table has a foreign key onto srv6_domains, so that model
 # has to be registered before the schema is created.
+from networking_srv6_agent.common import constants
 from networking_srv6_agent.db import domain_db
 from networking_srv6_agent.db import srv6_db
+from networking_srv6_agent.tests.unit.db import test_te_db
 
 
 class Srv6DbTestCase(testlib_api.SqlTestCase):
@@ -345,3 +348,61 @@ class TestParseHexRanges(base.BaseTestCase):
     def test_the_last_domain_id_is_allocatable(self):
         self.assertEqual([(0xef00, 0xefff)],
                          srv6_db.parse_function_id_ranges(['0xef00:0xefff']))
+
+
+class TestMigratingPorts(test_te_db.Srv6TeDbTestCase):
+    """The migrating set: an INACTIVE binding, or the server's handover mark.
+
+    After the activation nova deletes the source binding before the port is
+    ACTIVE on the destination; only the mark covers that gap.
+    """
+
+    def _binding(self, port_id, host, status):
+        with db_api.CONTEXT_WRITER.using(self.ctx):
+            self.ctx.session.add(ml2_models.PortBinding(
+                port_id=port_id, host=host, vif_type='ovs', vnic_type='normal',
+                status=status))
+
+    def test_an_inactive_binding_is_migrating(self):
+        port = self._create_port()
+        self._binding(port, 'cn1', 'ACTIVE')
+        self._binding(port, 'cn2', 'INACTIVE')
+        self.assertEqual({port}, srv6_db.get_migrating_port_ids(
+            self.ctx, [port]))
+
+    def test_a_marked_port_is_migrating_without_a_second_binding(self):
+        port, other = self._create_port(), self._create_port()
+        self._binding(port, 'cn2', 'ACTIVE')
+        srv6_db.mark_migrating(self.ctx, port)
+        self.assertEqual({port}, srv6_db.get_migrating_port_ids(
+            self.ctx, [port, other]))
+
+    def test_a_mark_older_than_the_ttl_is_ignored(self):
+        port = self._create_port()
+        old = (datetime.datetime.utcnow() - datetime.timedelta(
+            seconds=constants.MIGRATION_MARK_TTL + 1))
+        with mock.patch.object(srv6_db.timeutils, 'utcnow', return_value=old):
+            srv6_db.mark_migrating(self.ctx, port)
+        self.assertEqual(set(), srv6_db.get_migrating_port_ids(
+            self.ctx, [port]))
+
+    def test_marking_twice_renews_the_mark(self):
+        port = self._create_port()
+        old = (datetime.datetime.utcnow() - datetime.timedelta(
+            seconds=constants.MIGRATION_MARK_TTL + 1))
+        with mock.patch.object(srv6_db.timeutils, 'utcnow', return_value=old):
+            srv6_db.mark_migrating(self.ctx, port)
+        srv6_db.mark_migrating(self.ctx, port)
+        self.assertEqual({port}, srv6_db.get_migrating_port_ids(
+            self.ctx, [port]))
+
+    def test_clear_removes_the_mark(self):
+        port = self._create_port()
+        srv6_db.mark_migrating(self.ctx, port)
+        srv6_db.clear_migrating(self.ctx, port)
+        srv6_db.clear_migrating(self.ctx, port)   # nothing left: no error
+        self.assertEqual(set(), srv6_db.get_migrating_port_ids(
+            self.ctx, [port]))
+
+    def test_no_ports_asks_nothing(self):
+        self.assertEqual(set(), srv6_db.get_migrating_port_ids(self.ctx, []))

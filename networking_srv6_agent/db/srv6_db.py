@@ -21,6 +21,7 @@ SELECT-then-INSERT. Two simultaneous domain-create requests therefore cannot
 be handed the same id -- one of the two UPDATEs matches zero rows and retries.
 """
 
+import datetime
 import random
 
 from neutron.plugins.ml2 import models as ml2_models
@@ -28,6 +29,7 @@ from neutron_lib import constants as n_const
 from neutron_lib.db import api as db_api
 from neutron_lib.db import model_base
 from oslo_log import log as logging
+from oslo_utils import timeutils
 import sqlalchemy as sa
 from sqlalchemy import orm
 
@@ -74,6 +76,21 @@ class SRv6HostLocator(model_base.BASEV2):
     host = sa.Column(sa.String(255), nullable=False, primary_key=True)
     locator = sa.Column(sa.String(64), nullable=False)
     updated_at = sa.Column(sa.DateTime, nullable=True)
+
+
+class SRv6MigratingPort(model_base.BASEV2):
+    """A port the server saw handed over to a new node, not yet ACTIVE.
+
+    Nova deletes the source binding before the destination reports the
+    port up, so for that window this row is the only sign of the
+    migration in the database.
+    """
+    __tablename__ = 'srv6_migrating_ports'
+
+    port_id = sa.Column(sa.String(36),
+                        sa.ForeignKey('ports.id', ondelete='CASCADE'),
+                        nullable=False, primary_key=True)
+    created_at = sa.Column(sa.DateTime, nullable=False)
 
 
 def _parse_function_id(text):
@@ -256,18 +273,45 @@ def get_host_locator_details(context):
 def get_migrating_port_ids(context, port_ids):
     """The ports among port_ids that are being live-migrated.
 
-    Nova gives a port a second, INACTIVE binding for the whole migration:
-    on the destination before the move, on the source once the destination
-    binding is activated, until the port is ACTIVE there and nova removes
-    it. The profile's migrating_to is no marker after the activation: it
-    stays on the old binding only.
+    Nova gives a port a second, INACTIVE binding for the migration: on the
+    destination before the move, on the source once the destination
+    binding is activated. It deletes that one about a second before the
+    port is ACTIVE on the destination, so a handover mark younger than
+    MIGRATION_MARK_TTL (mark_migrating) counts too. The profile's
+    migrating_to is no marker after the activation: it stays on the old
+    binding only.
     """
     if not port_ids:
         return set()
-    return {row.port_id for row in context.session.query(
+    port_ids = list(port_ids)
+    since = timeutils.utcnow() - datetime.timedelta(
+        seconds=constants.MIGRATION_MARK_TTL)
+    marked = {row.port_id for row in context.session.query(
+        SRv6MigratingPort.port_id).filter(
+            SRv6MigratingPort.port_id.in_(port_ids),
+            SRv6MigratingPort.created_at >= since)}
+    return marked | {row.port_id for row in context.session.query(
         ml2_models.PortBinding.port_id).filter(
-            ml2_models.PortBinding.port_id.in_(list(port_ids)),
+            ml2_models.PortBinding.port_id.in_(port_ids),
             ml2_models.PortBinding.status == n_const.INACTIVE)}
+
+
+@db_api.CONTEXT_WRITER
+def mark_migrating(context, port_id):
+    """Mark a live-migration handover of port_id now (a new mark renews)."""
+    row = context.session.get(SRv6MigratingPort, port_id)
+    if row is None:
+        context.session.add(SRv6MigratingPort(port_id=port_id,
+                                              created_at=timeutils.utcnow()))
+    else:
+        row.created_at = timeutils.utcnow()
+
+
+@db_api.CONTEXT_WRITER
+def clear_migrating(context, port_id):
+    """Drop the handover mark of port_id, if any."""
+    context.session.query(SRv6MigratingPort).filter_by(
+        port_id=port_id).delete()
 
 
 class NoFunctionIdAvailable(Exception):

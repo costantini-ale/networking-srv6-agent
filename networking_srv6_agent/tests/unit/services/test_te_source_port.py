@@ -204,6 +204,14 @@ class TestPayload(SourcePortTestCase):
         [r] = self._attach(maps, test_te._route(DST))
         self.assertNotIn('segments_by_source_port', r)
 
+    def test_a_vm_known_only_by_its_host_field_steers_from_that_node(self):
+        # the host rule of its own route: binding host, else `host`
+        self.ports[VM][portbindings.HOST_ID] = ''
+        self.ports[VM]['host'] = 'node1'
+        [r] = self._attach({VM: {'by_port': {DST: ['node3']},
+                                 'by_host': {}}}, test_te._route(DST))
+        self.assertEqual('node1', r['segments_by_source_port'][VM]['host'])
+
     def test_only_vm_paths_still_steer(self):
         # the early return for a domain with no path must not skip them
         [r] = self._attach({VM: {'by_port': {DST: ['node3']},
@@ -240,6 +248,21 @@ class TestResolve(SourcePortTestCase):
         self.ports[VM][portbindings.HOST_ID] = 'node2'
         path = self._resolve(source_port_id=VM, destination_port_id=DST)
         self.assertEqual(te_def.STATUS_DEGRADED, path['status'])
+
+
+class TestHostOfPort(SourcePortTestCase):
+
+    def test_the_routes_host_rule(self):
+        self.assertEqual('node1', self.plugin.host_of_port(self.ctx, VM))
+        self.ports[VM][portbindings.HOST_ID] = ''
+        self.ports[VM]['host'] = 'node3'
+        self.assertEqual('node3', self.plugin.host_of_port(self.ctx, VM))
+
+    def test_none_for_an_unbound_missing_or_unnamed_port(self):
+        self.ports[VM][portbindings.HOST_ID] = ''
+        self.assertIsNone(self.plugin.host_of_port(self.ctx, VM))
+        self.assertIsNone(self.plugin.host_of_port(self.ctx, 'gone'))
+        self.assertIsNone(self.plugin.host_of_port(self.ctx, None))
 
 
 class TestVmMovesAndGoes(SourcePortTestCase):
