@@ -259,8 +259,9 @@ class Srv6LinuxDataplane:
         # gateway port name -> the ND/ARP flow matches installed for it
         self.tunnel_patch_port = tunnel_patch_port
         self.gateway_nd_flows = {}
-        # domain_id -> DomainState, and domain_id -> {network_id: port name}
-        self.domains = {}
+        # domain_id -> {network_id: port name}. Which domains are programmed
+        # is the agent's record, not this object's: every per-domain call
+        # names the function id.
         self.gateway_ports = collections.defaultdict(dict)
         # True only after a successful apply; the networks it covers then.
         self.edge_filter_active = False
@@ -392,8 +393,10 @@ class Srv6LinuxDataplane:
         # would otherwise linger in main until the domain is deleted.
         old_len = 128 if self.decap_prefixlen != 128 else \
             constants.USID_FUNCTION_PREFIXLEN
-        for state in self.domains.values():
-            self._delete_decap_route(state.function_id, old_len)
+        # The kernel's VRFs, not only the domains programmed now: also
+        # catches a decap SID left from before a restart.
+        for function_id in sorted(self.present_function_ids() or ()):
+            self._delete_decap_route(function_id, old_len)
         self._mtu_warned.clear()
         LOG.info("SRv6: dataplane encoding %(old)s -> %(new)s",
                  {'old': previous, 'new': encoding})
@@ -701,10 +704,10 @@ class Srv6LinuxDataplane:
     def ensure_domain(self, domain_id, function_id, behavior):
         """Create the VRF, seal it, and install this node's decap SID.
 
-        Idempotent. The seal comes before the SID and before the domain is
-        recorded, so no gateway port can ever be enslaved to an unsealed
-        VRF: ensure_gateway_port refuses a domain this method has not
-        recorded.
+        Idempotent. The seal comes before the SID, and a seal that fails
+        raises, so no gateway port can ever be enslaved to an unsealed VRF:
+        the agent asks for gateway ports only of a domain this method
+        returned for.
         """
         vrf_table = sid.vrf_table(function_id, self.vrf_table_base)
         vrf_name = sid.vrf_name(function_id)
@@ -743,9 +746,12 @@ class Srv6LinuxDataplane:
                  {'d': domain_id, 'sid': local_sid, 'b': behavior,
                   'l': self.decap_prefixlen, 't': vrf_table})
 
-        self.domains[domain_id] = DomainState(domain_id, function_id,
-                                              vrf_table, vrf_name)
-        return self.domains[domain_id]
+        return DomainState(domain_id, function_id, vrf_table, vrf_name)
+
+    def _domain_state(self, domain_id, function_id):
+        return DomainState(domain_id, function_id,
+                           sid.vrf_table(function_id, self.vrf_table_base),
+                           sid.vrf_name(function_id))
 
     @staticmethod
     def _seal_table(domain_id, vrf_table):
@@ -777,20 +783,16 @@ class Srv6LinuxDataplane:
         objects -- but it is derived here from the function id, the same
         way it was derived when the table was created.
         """
-        state = self.domains.pop(domain_id, None) if domain_id else None
-        if state is not None:
-            function_id = state.function_id
         if function_id is None:
             LOG.debug("SRv6: nothing to delete for unknown domain %s",
                       domain_id)
             return
-        vrf_name = sid.vrf_name(function_id)
-        table = sid.vrf_table(function_id, self.vrf_table_base)
+        state = self._domain_state(domain_id, function_id)
+        vrf_name, table = state.vrf_name, state.vrf_table
 
         # Reconciled to nothing first: steering, routes and SID rules, while
         # the gateway ports and the VRF their rules name still exist.
-        self._reconcile(DomainState(domain_id, function_id, table, vrf_name),
-                        ({}, {}, set()))
+        self._reconcile(state, ({}, {}, set()))
 
         # The bridge, not only the in-memory map: after a restart the map is
         # empty while every svp-<fid>-* port is still on br-int.
@@ -847,8 +849,8 @@ class Srv6LinuxDataplane:
     # ------------------------------------------------------------------
     # gateway ports
     # ------------------------------------------------------------------
-    def ensure_gateway_port(self, domain_id, network_id, local_vlan, subnets,
-                            mtu=None):
+    def ensure_gateway_port(self, domain_id, function_id, network_id,
+                            local_vlan, subnets, mtu=None):
         """An OVS internal port owning the subnet gateway inside the VRF.
 
         This is what pulls tenant traffic into the domain: the instances'
@@ -857,17 +859,13 @@ class Srv6LinuxDataplane:
         the VRF, its connected route lands in the domain's table rather than
         in main.
         """
-        state = self.domains.get(domain_id)
-        if state is None:
-            LOG.debug("SRv6: gateway port requested for unknown domain %s",
-                      domain_id)
-            return None
         if local_vlan is None:
             LOG.debug("SRv6: network %s has no local VLAN on this node yet",
                       network_id)
             return None
 
-        port_name = sid.gateway_port_name(state.function_id, local_vlan)
+        state = self._domain_state(domain_id, function_id)
+        port_name = sid.gateway_port_name(function_id, local_vlan)
         if self.bridge is not None:
             # 'type' is an Interface column and goes through add_port; 'tag'
             # is a *Port* column and must be set separately. Passing tag to
@@ -1069,7 +1067,7 @@ class Srv6LinuxDataplane:
                   {'a': address, 'p': port_name})
         priv_seg6.send_garp(port_name, address)
 
-    def reconcile_gateway_ports(self, domain_id, local_vlans):
+    def reconcile_gateway_ports(self, domain_id, function_id, local_vlans):
         """Delete gateway ports for networks that are no longer local.
 
         local_vlans is the set of VLANs on which the domain's networks have
@@ -1089,12 +1087,9 @@ class Srv6LinuxDataplane:
         come from OVSDB, which is not empty at a restart, so the branch is
         gone.
         """
-        state = self.domains.get(domain_id)
-        if state is None:
-            return
-        wanted = {sid.gateway_port_name(state.function_id, vlan)
+        wanted = {sid.gateway_port_name(function_id, vlan)
                   for vlan in local_vlans}
-        for port_name in self._bridge_gateway_ports(state.function_id):
+        for port_name in self._bridge_gateway_ports(function_id):
             if port_name in wanted:
                 continue
             LOG.info("SRv6: domain %(d)s no longer has a network on local "
@@ -1338,8 +1333,8 @@ class Srv6LinuxDataplane:
             return by_source[local_host]
         return route.get('segments')
 
-    def sync_routes(self, domain_id, routes, locators, local_host, mtus=None,
-                    gateway_ports=None):
+    def sync_routes(self, domain_id, function_id, routes, locators,
+                    local_host, mtus=None, gateway_ports=None):
         """Make the domain's routes, steer tables and SID rules match routes.
 
         `routes` is the whole domain, every time: what it does not name is
@@ -1359,9 +1354,7 @@ class Srv6LinuxDataplane:
         entered through its network's gateway port in `gateway_ports`).
         `mtus` maps network_id -> MTU, for the per-route check.
         """
-        state = self.domains.get(domain_id)
-        if state is None:
-            return
+        state = self._domain_state(domain_id, function_id)
         self._reconcile(state, self._wanted(state, routes, locators,
                                             local_host, mtus, gateway_ports))
 

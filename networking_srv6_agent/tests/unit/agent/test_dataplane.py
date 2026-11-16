@@ -179,6 +179,7 @@ class DataplaneTestCaseBase(base.BaseTestCase):
         self.device = self.ip_lib.IPDevice.return_value
         self.device.addr.list.return_value = []
         self.domain_id = uuidutils.generate_uuid()
+        self.function_id = FUNCTION_ID
         self.dp = dataplane.Srv6LinuxDataplane(
             locator=LOCATOR, underlay_interface=UNDERLAY,
             vrf_table_base=10000, bridge=self.bridge)
@@ -188,10 +189,6 @@ class DataplaneTestCaseBase(base.BaseTestCase):
         patched = patcher.start()
         self.addCleanup(patcher.stop)
         return patched
-
-    def _with_domain(self):
-        self.dp.domains[self.domain_id] = dataplane.DomainState(
-            self.domain_id, FUNCTION_ID, VRF_TABLE, VRF_NAME)
 
     def _fake_kernel(self):
         self.kernel = FakeKernel(self.priv_seg6, {VRF_TABLE: VRF_NAME})
@@ -324,9 +321,8 @@ class TestNodeEndSid(DataplaneTestCaseBase):
         # The End SID outlives every domain. Removing it here would silently
         # break traffic engineering for OTHER domains routed through here.
         self.dp.initialize_node()
-        self._with_domain()
         self.priv_seg6.reset_mock()
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         deleted = [c[0][0] for c in
                    self.priv_seg6.delete_route.call_args_list]
         self.assertNotIn('fc00:0:1:fff0::/128', deleted)
@@ -376,7 +372,6 @@ class TestDomainLifecycle(DataplaneTestCaseBase):
             VRF_NAME, None, 'vrf', vrf_table=VRF_TABLE)
         self.assertEqual(VRF_TABLE, state.vrf_table)
         self.assertEqual(VRF_NAME, state.vrf_name)
-        self.assertEqual(state, self.dp.domains[self.domain_id])
 
     def test_ensure_domain_installs_the_decap_sid(self):
         self.ip_lib.device_exists.return_value = False
@@ -412,10 +407,9 @@ class TestDomainLifecycle(DataplaneTestCaseBase):
                         calls.index(('create', VRF_NAME)))
 
     def test_delete_domain_removes_everything(self):
-        self._with_domain()
         self.dp.gateway_ports[self.domain_id]['net1'] = PORT_NAME
         self.ip_lib.device_exists.return_value = True
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.bridge.delete_port.assert_called_once_with(PORT_NAME)
         # Both decap lengths, whatever the encoding: a /64 left from usid
         # mode must not outlive the domain either.
@@ -425,7 +419,6 @@ class TestDomainLifecycle(DataplaneTestCaseBase):
             self.priv_seg6.delete_route.call_args_list)
         self.priv_ip_lib.delete_interface.assert_called_once_with(
             VRF_NAME, None)
-        self.assertNotIn(self.domain_id, self.dp.domains)
 
     def test_delete_domain_uses_the_ids_the_server_sent(self):
         # After an agent restart the domain is unknown locally, so the
@@ -443,9 +436,8 @@ class TestDomainLifecycle(DataplaneTestCaseBase):
         self.priv_seg6.flush_table.assert_not_called()
 
     def test_delete_domain_survives_a_missing_vrf(self):
-        self._with_domain()
         self.ip_lib.device_exists.return_value = False
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.priv_ip_lib.delete_interface.assert_not_called()
 
 
@@ -453,7 +445,6 @@ class TestGatewayPort(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
         self.subnets = [{'id': 'sub1', 'cidr': '10.0.0.0/24',
                          'gateway_ip': '10.0.0.1'}]
@@ -466,7 +457,8 @@ class TestGatewayPort(DataplaneTestCaseBase):
         was never created, and the only symptom was a much later
         "interface svp-... not found".
         """
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.bridge.add_port.assert_called_once_with(PORT_NAME,
                                                      ('type', 'internal'))
         self.bridge.set_db_attribute.assert_called_once_with(
@@ -475,8 +467,10 @@ class TestGatewayPort(DataplaneTestCaseBase):
     def test_tag_is_reasserted_on_every_call(self):
         # The OVS agent reallocates local VLANs when ports rebind; a stale
         # tag puts the gateway in the wrong broadcast domain.
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 101, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 101, self.subnets)
         self.assertEqual(
             [mock.call('Port', 'svp-7-100', 'tag', 100),
              mock.call('Port', 'svp-7-101', 'tag', 101)],
@@ -489,18 +483,21 @@ class TestGatewayPort(DataplaneTestCaseBase):
         self.priv_seg6.set_link_master.side_effect = \
             lambda *a: order.append('master')
         self.device.addr.add.side_effect = lambda *a: order.append('addr')
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.assertEqual(['master', 'addr'], order)
 
     def test_gateway_address_is_added_with_the_subnet_prefixlen(self):
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.device.addr.add.assert_called_once_with('10.0.0.1/24')
 
     def test_existing_address_is_not_added_again(self):
         # Asking beats adding and interpreting the failure: resync runs this
         # repeatedly.
         self.device.addr.list.return_value = [{'cidr': '10.0.0.1/24'}]
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.device.addr.add.assert_not_called()
 
     def test_an_address_of_no_subnet_is_removed(self):
@@ -510,20 +507,20 @@ class TestGatewayPort(DataplaneTestCaseBase):
             {'cidr': '10.0.0.1/24'}, {'cidr': '10.0.9.1/24'},
             {'cidr': 'fe80::1/64'}, {'cidr': 'fd98:1:0::1/64'}]
         self.dp.ensure_gateway_port(
-            self.domain_id, 'net1', 100, self.subnets + [
+            self.domain_id, self.function_id, 'net1', 100, self.subnets + [
                 {'id': 'sub6', 'cidr': 'fd98:1::/64',
                  'gateway_ip': 'fd98:1::1'}])
         self.device.addr.delete.assert_called_once_with('10.0.9.1/24')
 
     def test_subnet_without_a_gateway_is_skipped(self):
         self.dp.ensure_gateway_port(
-            self.domain_id, 'net1', 100,
+            self.domain_id, self.function_id, 'net1', 100,
             [{'id': 'sub1', 'cidr': '10.0.0.0/24', 'gateway_ip': None}])
         self.device.addr.add.assert_not_called()
 
     def test_dual_stack_subnets(self):
         self.dp.ensure_gateway_port(
-            self.domain_id, 'net1', 100,
+            self.domain_id, self.function_id, 'net1', 100,
             self.subnets + [{'id': 'sub2', 'cidr': '2001:db8::/64',
                              'gateway_ip': '2001:db8::1'}])
         self.assertEqual([mock.call('10.0.0.1/24')],
@@ -533,8 +530,8 @@ class TestGatewayPort(DataplaneTestCaseBase):
             PORT_NAME, '2001:db8::1/64')
 
     def test_port_is_recorded_for_teardown(self):
-        name = self.dp.ensure_gateway_port(self.domain_id, 'net1', 100,
-                                           self.subnets)
+        name = self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.assertEqual(PORT_NAME, name)
         self.assertEqual({'net1': PORT_NAME},
                          self.dp.gateway_ports[self.domain_id])
@@ -548,8 +545,8 @@ class TestGatewayPort(DataplaneTestCaseBase):
         """
         with mock.patch.object(self.dp, '_wait_for_device',
                                return_value=False):
-            result = self.dp.ensure_gateway_port(self.domain_id, 'net1', 100,
-                                                 self.subnets)
+            result = self.dp.ensure_gateway_port(
+                self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.assertIsNone(result)
         self.priv_seg6.set_link_master.assert_not_called()
         self.assertEqual({}, self.dp.gateway_ports[self.domain_id])
@@ -565,17 +562,12 @@ class TestGatewayPort(DataplaneTestCaseBase):
     def test_failure_to_enslave_leaves_nothing_half_programmed(self):
         self.priv_seg6.set_link_master.side_effect = RuntimeError('boom')
         self.assertIsNone(self.dp.ensure_gateway_port(
-            self.domain_id, 'net1', 100, self.subnets))
+            self.domain_id, self.function_id, 'net1', 100, self.subnets))
         self.device.addr.add.assert_not_called()
-
-    def test_unknown_domain_is_ignored(self):
-        self.assertIsNone(self.dp.ensure_gateway_port(
-            'no-such-domain', 'net1', 100, self.subnets))
-        self.bridge.add_port.assert_not_called()
 
     def test_network_without_a_local_vlan_is_ignored(self):
         self.assertIsNone(self.dp.ensure_gateway_port(
-            self.domain_id, 'net1', None, self.subnets))
+            self.domain_id, self.function_id, 'net1', None, self.subnets))
         self.bridge.add_port.assert_not_called()
 
     def test_a_reallocated_vlan_does_not_orphan_the_previous_port(self):
@@ -585,15 +577,19 @@ class TestGatewayPort(DataplaneTestCaseBase):
         the new name overwrote the only reference to the old port, which
         then survived every teardown path there is.
         """
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 101, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 101, self.subnets)
         self.bridge.delete_port.assert_called_once_with('svp-7-100')
         self.assertEqual({'net1': 'svp-7-101'},
                          self.dp.gateway_ports[self.domain_id])
 
     def test_the_same_vlan_twice_deletes_nothing(self):
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, self.subnets)
         self.bridge.delete_port.assert_not_called()
 
 
@@ -612,7 +608,6 @@ class TestGatewayFirewallFlows(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
         self.subnets = [{'id': 'sub1', 'cidr': '10.0.0.0/24',
                          'gateway_ip': '10.0.0.1'}]
@@ -620,8 +615,8 @@ class TestGatewayFirewallFlows(DataplaneTestCaseBase):
         self.bridge.get_port_ofport.return_value = self.OFPORT
 
     def _ensure(self, vlan=100):
-        return self.dp.ensure_gateway_port(self.domain_id, 'net1', vlan,
-                                           self.subnets)
+        return self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', vlan, self.subnets)
 
     def _expected_flows(self, ofport=OFPORT, vlan=100):
         return [
@@ -753,13 +748,14 @@ class TestGatewayFirewallFlows(DataplaneTestCaseBase):
     def test_reconciliation_removes_the_flows_of_a_leftover(self):
         self._ensure()
         self.bridge.get_port_name_list.return_value = [PORT_NAME]
-        self.dp.reconcile_gateway_ports(self.domain_id, set())
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, set())
         self.assertEqual(2, self.bridge.delete_flows.call_count)
         self.assertEqual({}, self.dp.gateway_flows)
 
     def test_deleting_the_domain_removes_the_flows(self):
         self._ensure()
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual(2, self.bridge.delete_flows.call_count)
         self.assertEqual({}, self.dp.gateway_flows)
 
@@ -783,12 +779,11 @@ class TestGatewayIpv6NoDad(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
 
     def _ensure(self):
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', 100,
-                                    [self.V4, self.V6])
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', 100, [self.V4, self.V6])
 
     def test_ipv6_is_nodad_and_ipv4_is_unchanged(self):
         self._ensure()
@@ -830,7 +825,6 @@ class TestGatewayNdFlows(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
         self.dp.tunnel_patch_port = 'patch-tun'
         self.bridge.get_port_ofport.side_effect = \
@@ -840,9 +834,9 @@ class TestGatewayNdFlows(DataplaneTestCaseBase):
             {'id': 's6', 'cidr': 'fd98:1::/64', 'gateway_ip': 'fd98:1::'}]
 
     def _ensure(self, vlan=100, subnets=None):
-        self.dp.ensure_gateway_port(self.domain_id, 'net1', vlan,
-                                    self.subnets if subnets is None
-                                    else subnets)
+        self.dp.ensure_gateway_port(
+            self.domain_id, self.function_id, 'net1', vlan,
+            self.subnets if subnets is None else subnets)
 
     @staticmethod
     def _flow(vlan=100, **match):
@@ -1001,7 +995,6 @@ class TestGatewayPortReconciliation(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
         # The bridge is the source of truth, not self.gateway_ports: the
         # ports outlive the agent process and the map starts empty.
@@ -1009,25 +1002,30 @@ class TestGatewayPortReconciliation(DataplaneTestCaseBase):
             'svp-7-100', 'svp-7-101', 'svp-9-100', 'tap-something']
 
     def test_a_network_that_left_the_domain_loses_its_port(self):
-        self.dp.reconcile_gateway_ports(self.domain_id, {100})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100})
         self.bridge.delete_port.assert_called_once_with('svp-7-101')
 
     def test_the_networks_that_stayed_keep_theirs(self):
-        self.dp.reconcile_gateway_ports(self.domain_id, {100, 101})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100, 101})
         self.bridge.delete_port.assert_not_called()
 
     def test_another_domains_ports_are_never_touched(self):
         # svp-9-100 belongs to function id 9. Matching on the bare prefix
         # would delete it.
-        self.dp.reconcile_gateway_ports(self.domain_id, {100, 101})
-        self.dp.reconcile_gateway_ports(self.domain_id, set())
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100, 101})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, set())
         for call in self.bridge.delete_port.call_args_list:
             self.assertTrue(call[0][0].startswith('svp-7-'))
 
     def test_the_last_network_leaving_empties_the_domain(self):
         # The case in the evidence file: the domain survives with no
         # networks.
-        self.dp.reconcile_gateway_ports(self.domain_id, set())
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, set())
         self.assertEqual(
             sorted([mock.call('svp-7-100'), mock.call('svp-7-101')], key=str),
             sorted(self.bridge.delete_port.call_args_list, key=str))
@@ -1043,7 +1041,8 @@ class TestGatewayPortReconciliation(DataplaneTestCaseBase):
         the leak survived every restart.
         """
         self.assertEqual({}, self.dp.gateway_ports[self.domain_id])
-        self.dp.reconcile_gateway_ports(self.domain_id, {100})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100})
         self.bridge.delete_port.assert_called_once_with('svp-7-101')
 
     def test_an_empty_wanted_set_deletes_every_port_of_the_domain(self):
@@ -1055,7 +1054,8 @@ class TestGatewayPortReconciliation(DataplaneTestCaseBase):
         reach another network that then injected into the domain. The
         wanted set now comes from OVSDB, so empty means empty.
         """
-        self.dp.reconcile_gateway_ports(self.domain_id, set())
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, set())
         self.assertEqual(
             sorted([mock.call('svp-7-100'), mock.call('svp-7-101')], key=str),
             sorted(self.bridge.delete_port.call_args_list, key=str))
@@ -1063,24 +1063,24 @@ class TestGatewayPortReconciliation(DataplaneTestCaseBase):
     def test_the_stale_entry_is_dropped_from_the_map_too(self):
         self.dp.gateway_ports[self.domain_id] = {'net1': 'svp-7-100',
                                                  'net2': 'svp-7-101'}
-        self.dp.reconcile_gateway_ports(self.domain_id, {100})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100})
         self.assertEqual({'net1': 'svp-7-100'},
                          self.dp.gateway_ports[self.domain_id])
 
-    def test_reconciling_an_unknown_domain_is_a_noop(self):
-        self.dp.reconcile_gateway_ports('no-such-domain', set())
-        self.bridge.delete_port.assert_not_called()
-
     def test_reconciliation_is_idempotent(self):
-        self.dp.reconcile_gateway_ports(self.domain_id, {100})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100})
         self.bridge.reset_mock()
         self.bridge.get_port_name_list.return_value = ['svp-7-100']
-        self.dp.reconcile_gateway_ports(self.domain_id, {100})
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, {100})
         self.bridge.delete_port.assert_not_called()
 
     def test_a_bridge_that_cannot_be_listed_deletes_nothing(self):
         self.bridge.get_port_name_list.side_effect = RuntimeError('boom')
-        self.dp.reconcile_gateway_ports(self.domain_id, set())
+        self.dp.reconcile_gateway_ports(
+            self.domain_id, self.function_id, set())
         self.bridge.delete_port.assert_not_called()
 
 
@@ -1095,14 +1095,14 @@ class TestRouteReconciliation(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.locators = {'node2': LOCATOR2}
         self.kernel.routes[(VRF_TABLE, False)] = {
             '10.90.1.11': ['fc00:0:2:7::'], '10.90.2.21': ['fc00:0:2:7::']}
 
     def _sync(self, routes):
-        self.dp.sync_routes(self.domain_id, routes, self.locators, 'node1')
+        self.dp.sync_routes(
+            self.domain_id, self.function_id, routes, self.locators, 'node1')
 
     def _held(self, family_v6=False):
         return sorted(self.kernel.table(VRF_TABLE, family_v6))
@@ -1158,16 +1158,11 @@ class TestRouteReconciliation(DataplaneTestCaseBase):
         self._sync([])
         self.assertEqual(['10.90.1.11', '10.90.2.21'], self._held())
 
-    def test_reconciling_an_unknown_domain_is_a_noop(self):
-        self.dp.sync_routes('no-such-domain', [], self.locators, 'node1')
-        self.assertEqual(['10.90.1.11', '10.90.2.21'], self._held())
-
 
 class TestRoutes(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.locators = {'node2': LOCATOR2}
 
@@ -1175,7 +1170,7 @@ class TestRoutes(DataplaneTestCaseBase):
         return {'prefix': prefix, 'host': host, 'port_id': 'p1'}
 
     def _sync(self, *routes, locators=None):
-        self.dp.sync_routes(self.domain_id, list(routes),
+        self.dp.sync_routes(self.domain_id, self.function_id, list(routes),
                             locators or self.locators, 'node1')
 
     def test_remote_port_gets_an_encap_route(self):
@@ -1207,11 +1202,6 @@ class TestRoutes(DataplaneTestCaseBase):
         self.kernel.failing.add('10.0.0.5/32')
         self._sync(self._route('10.0.0.5/32'), self._route('10.0.0.6/32'))
         self.assertEqual(['10.0.0.6'], list(self.kernel.table(VRF_TABLE)))
-
-    def test_routes_for_an_unknown_domain_are_ignored(self):
-        self.dp.sync_routes('no-such-domain', [self._route()], self.locators,
-                            'node1')
-        self.priv_seg6.replace_seg6_route.assert_not_called()
 
     def test_a_route_that_goes_leaves_the_domains_steer_tables_too(self):
         # A path to a deleted port goes with it and nothing else is pushed;
@@ -1293,44 +1283,38 @@ class TestSeal(DataplaneTestCaseBase):
             4, self.priv_seg6.replace_unreachable_default.call_count)
 
     def test_a_vrf_that_cannot_be_sealed_is_not_programmed(self):
-        # Fail closed: no SID, no recorded state -- and therefore no gateway
-        # port, because ensure_gateway_port refuses an unrecorded domain.
+        # Fail closed: no SID, and an error, so the agent does not record
+        # the domain as programmed and asks for no gateway port.
         self.priv_seg6.replace_unreachable_default.side_effect = \
             RuntimeError('boom')
         self.assertRaises(dataplane.Srv6DataplaneError,
                           self.dp.ensure_domain,
                           self.domain_id, FUNCTION_ID, 'End.DT46')
         self.priv_seg6.replace_seg6local_route.assert_not_called()
-        self.assertNotIn(self.domain_id, self.dp.domains)
-        self.assertIsNone(self.dp.ensure_gateway_port(
-            self.domain_id, 'net1', 100, []))
 
 
 class TestDeleteFlushesTheTable(DataplaneTestCaseBase):
     """Deleting the VRF device does not empty its table."""
 
     def test_both_families_are_flushed(self):
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual(
             [mock.call(VRF_TABLE, family_v6=False),
              mock.call(VRF_TABLE, family_v6=True)],
             self.priv_seg6.flush_table.call_args_list)
 
     def test_after_the_device_is_gone(self):
-        self._with_domain()
         self.ip_lib.device_exists.return_value = True
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         order = [c[0] for c in self.priv_seg6.method_calls] + []
         self.assertEqual('flush_table', order[-1])
         self.assertTrue(self.priv_ip_lib.delete_interface.called)
 
     def test_even_when_the_device_is_already_gone(self):
         # The routes outlive the device; that is the whole point.
-        self._with_domain()
         self.ip_lib.device_exists.return_value = False
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual(2, self.priv_seg6.flush_table.call_count)
 
 
@@ -1360,9 +1344,8 @@ class TestDeleteAfterRestart(DataplaneTestCaseBase):
         self.priv_seg6.flush_table.assert_any_call(10009, family_v6=True)
 
     def test_a_port_known_both_ways_is_deleted_once(self):
-        self._with_domain()
         self.dp.gateway_ports[self.domain_id]['net1'] = 'svp-7-100'
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual(2, self.bridge.delete_port.call_count)
 
 
@@ -1398,7 +1381,6 @@ class TestSidRules(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.locators = {'node2': LOCATOR2, 'node3': LOCATOR3}
 
@@ -1409,7 +1391,7 @@ class TestSidRules(DataplaneTestCaseBase):
         return route
 
     def _sync(self, *routes, locators=None):
-        self.dp.sync_routes(self.domain_id, list(routes),
+        self.dp.sync_routes(self.domain_id, self.function_id, list(routes),
                             locators or self.locators, 'node1')
 
     def test_one_rule_per_remote_node_not_per_route(self):
@@ -1488,7 +1470,7 @@ class TestSidRules(DataplaneTestCaseBase):
         at_vrf_delete = []
         self.priv_ip_lib.delete_interface.side_effect = \
             lambda *a: at_vrf_delete.append(set(self.kernel.sid_rules))
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual([{('sv6vrf-9', 'fc00:0:2:9::')}], at_vrf_delete)
 
     def test_a_rule_without_its_vrf_is_still_an_orphan(self):
@@ -1512,12 +1494,11 @@ class TestSegments(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
 
     def _segs(self, segments):
         self.dp.sync_routes(
-            self.domain_id,
+            self.domain_id, self.function_id,
             [{'prefix': '10.0.0.5/32', 'host': 'node2', 'port_id': 'p1',
               'segments': segments}],
             {'node2': LOCATOR2}, 'node1')
@@ -1677,7 +1658,6 @@ class TestEndSidRules(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.locators = {'node2': LOCATOR2, 'node3': LOCATOR3}
 
@@ -1688,8 +1668,9 @@ class TestEndSidRules(DataplaneTestCaseBase):
         return route
 
     def _sync(self, *routes):
-        self.dp.sync_routes(self.domain_id, list(routes), self.locators,
-                            'node1')
+        self.dp.sync_routes(
+            self.domain_id, self.function_id, list(routes), self.locators,
+            'node1')
 
     def test_no_filter_no_rule(self):
         self._sync(self._route(segments=['fc00:0:2:fff0::']))
@@ -1773,7 +1754,6 @@ class TestSourceSegments(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.locators = {'node2': LOCATOR2, 'node3': LOCATOR3}
 
@@ -1786,8 +1766,9 @@ class TestSourceSegments(DataplaneTestCaseBase):
         return route
 
     def _segs(self, route, local_host='node1'):
-        self.dp.sync_routes(self.domain_id, [route], self.locators,
-                            local_host)
+        self.dp.sync_routes(
+            self.domain_id, self.function_id, [route], self.locators,
+            local_host)
         return self.kernel.table(VRF_TABLE)['10.0.0.5']
 
     def test_the_own_entry_is_used(self):
@@ -1826,7 +1807,7 @@ class TestSourceSegments(DataplaneTestCaseBase):
     def test_a_local_route_is_skipped_even_with_an_own_entry(self):
         # The destination's own node never encapsulates its VMs.
         self.dp.sync_routes(
-            self.domain_id,
+            self.domain_id, self.function_id,
             [self._route(host='node1',
                          by_source={'node1': ['fc00:0:3:fff0::']})],
             dict(self.locators, node1=LOCATOR), 'node1')
@@ -1855,7 +1836,6 @@ class TestRouteMtu(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self.device.link.mtu = 1500
         check = mock.patch.object(self.dp, 'check_mtu',
                                   wraps=self.dp.check_mtu)
@@ -1870,8 +1850,9 @@ class TestRouteMtu(DataplaneTestCaseBase):
         return route
 
     def _sync(self, route, mtu):
-        self.dp.sync_routes(self.domain_id, [route], {'node2': LOCATOR2},
-                            'node1', mtus={'net1': mtu})
+        self.dp.sync_routes(
+            self.domain_id, self.function_id, [route], {'node2': LOCATOR2},
+            'node1', mtus={'net1': mtu})
 
     def test_a_steered_route_that_does_not_fit_warns_once(self):
         # 1436 fits at depth 1 (+64) and not at depth 2 (+80).
@@ -1900,7 +1881,7 @@ class TestRouteMtu(DataplaneTestCaseBase):
         self.check_mtu.assert_not_called()
 
     def test_a_network_with_no_known_mtu_is_not_checked(self):
-        self.dp.sync_routes(self.domain_id,
+        self.dp.sync_routes(self.domain_id, self.function_id,
                             [self._route(['fc00:0:2:fff0::'])],
                             {'node2': LOCATOR2}, 'node1')
         self.check_mtu.assert_not_called()
@@ -1978,7 +1959,9 @@ class TestUsidNode(DataplaneTestCaseBase):
         self.priv_seg6.replace_seg6local_route.assert_not_called()
 
     def test_a_switch_moves_known_decap_sids_to_the_new_length(self):
-        self._with_domain()
+        # Every VRF in the kernel, also one from before a restart.
+        self.priv_seg6.list_vrf_names.return_value = [VRF_NAME]
+        self.priv_seg6.list_sid_rules.return_value = []
         self.dp.ensure_encoding('usid')
         self.priv_seg6.delete_route.assert_called_once_with(
             'fc00:0:1:7::/128', 'main', family_v6=True)
@@ -2012,15 +1995,14 @@ class TestUsidRoutes(DataplaneTestCaseBase):
     def setUp(self):
         super().setUp()
         self.dp.ensure_encoding('usid')
-        self.dp.domains[self.domain_id] = dataplane.DomainState(
-            self.domain_id, 0xe005, 10000 + 0xe005, 'sv6vrf-57349')
+        self.function_id = 0xe005
         self.dp.ensure_edge_filter(sorted(self.LOCATORS.values()))
         self.priv_seg6.reset_mock()
         self.priv_seg6.list_sid_rules.return_value = []
 
     def _route(self, segments=None):
         self.dp.sync_routes(
-            self.domain_id,
+            self.domain_id, self.function_id,
             [{'prefix': '10.0.0.5/32', 'host': 'node3', 'port_id': 'p1',
               'segments': segments}],
             self.LOCATORS, 'node1')
@@ -2041,7 +2023,7 @@ class TestUsidRoutes(DataplaneTestCaseBase):
 
     def test_a_source_entry_is_packed_too(self):
         self.dp.sync_routes(
-            self.domain_id,
+            self.domain_id, self.function_id,
             [{'prefix': '10.0.0.5/32', 'host': 'node3', 'port_id': 'p1',
               'segments_by_source': {'node1': ['fc00:0:2::']}}],
             self.LOCATORS, 'node1')
@@ -2079,7 +2061,8 @@ class TestUnderlayAutodetect(DataplaneTestCaseBase):
     def _route_devs(self, routes):
         self.dp.refresh_underlay([LOCATOR, LOCATOR2, LOCATOR3])
         self.priv_seg6.replace_seg6_route.reset_mock()
-        self.dp.sync_routes(self.domain_id, routes, self.LOCATORS, 'node1')
+        self.dp.sync_routes(
+            self.domain_id, self.function_id, routes, self.LOCATORS, 'node1')
         return {c[0][0]: c[0][2] for c in
                 self.priv_seg6.replace_seg6_route.call_args_list}
 
@@ -2103,7 +2086,6 @@ class TestUnderlayAutodetect(DataplaneTestCaseBase):
             self.assertIn('net.ipv4.conf.%s.rp_filter' % dev, keys)
 
     def test_each_route_leaves_by_its_peers_device(self):
-        self._with_domain()
         self.assertEqual(
             {'10.0.0.2/32': 'wlan0', '10.0.0.3/32': 'eth1'},
             self._route_devs([
@@ -2113,7 +2095,6 @@ class TestUnderlayAutodetect(DataplaneTestCaseBase):
 
     def test_a_usid_te_path_leaves_towards_its_first_waypoint(self):
         self.dp.ensure_encoding('usid')
-        self._with_domain()
         self.assertEqual({'10.0.0.3/32': 'wlan0'}, self._route_devs([
             {'prefix': '10.0.0.3/32', 'host': 'node3', 'port_id': 'p3',
              'segments': ['fc00:0:2::']}]))
@@ -2121,7 +2102,6 @@ class TestUnderlayAutodetect(DataplaneTestCaseBase):
     def test_a_peer_without_a_route_is_skipped_alone(self):
         self.priv_seg6.route_get_dev.side_effect = {
             'fc00:0:2::': 'wlan0'}.get
-        self._with_domain()
         self.assertEqual({'10.0.0.2/32': 'wlan0'}, self._route_devs([
             {'prefix': '10.0.0.2/32', 'host': 'node2', 'port_id': 'p2'},
             {'prefix': '10.0.0.3/32', 'host': 'node3', 'port_id': 'p3'},
@@ -2162,7 +2142,6 @@ class TestSteering(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.locators = {'node2': LOCATOR2, 'node3': LOCATOR3}
 
@@ -2176,9 +2155,10 @@ class TestSteering(DataplaneTestCaseBase):
                     'segments': list(segments)}}}
 
     def _sync(self, *routes, ports=None):
-        self.dp.sync_routes(self.domain_id, list(routes), self.locators,
-                            'node1', gateway_ports={'net1': self.GW}
-                            if ports is None else ports)
+        self.dp.sync_routes(
+            self.domain_id, self.function_id, list(routes), self.locators,
+            'node1',
+            gateway_ports={'net1': self.GW} if ports is None else ports)
 
     def _filter_on(self):
         self.dp.ensure_edge_filter([LOCATOR2, LOCATOR3])
@@ -2299,7 +2279,7 @@ class TestSteering(DataplaneTestCaseBase):
                                    theirs}
         self.kernel.routes[(self.BASE, False)] = {'10.0.0.5': ['x']}
         self.kernel.routes[(self.BASE + 1, False)] = {'10.0.0.5': ['y']}
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual({theirs}, self.kernel.steer_rules)
         self.assertEqual({}, self.kernel.table(self.BASE))
         self.assertEqual({'10.0.0.5': ['y']},
@@ -2317,7 +2297,6 @@ class TestMakeBeforeBreak(DataplaneTestCaseBase):
 
     def setUp(self):
         super().setUp()
-        self._with_domain()
         self._fake_kernel()
         self.dp.ensure_edge_filter([LOCATOR2, LOCATOR3])
         self.locators = {'node2': LOCATOR2, 'node3': LOCATOR3}
@@ -2330,7 +2309,7 @@ class TestMakeBeforeBreak(DataplaneTestCaseBase):
             route['segments_by_source_port'] = {'vm1': {
                 'host': 'node1', 'network_id': 'net1',
                 'prefixes': ['10.0.1.9/32'], 'segments': vm_segments}}
-        self.dp.sync_routes(self.domain_id, [route],
+        self.dp.sync_routes(self.domain_id, self.function_id, [route],
                             dict(self.locators, node1=LOCATOR), 'node1',
                             gateway_ports={'net1': self.GW})
 
@@ -2359,7 +2338,7 @@ class TestMakeBeforeBreak(DataplaneTestCaseBase):
     def test_a_domain_torn_down(self):
         self._sync(segments=['fc00:0:3:fff0::'],
                    vm_segments=['fc00:0:2:fff0::'])
-        self.dp.delete_domain(self.domain_id)
+        self.dp.delete_domain(self.domain_id, self.function_id)
         self.assertEqual(set(), self.kernel.blackholes)
         self.assertEqual(set(), self.kernel.sid_rules)
         self.assertEqual(set(), self.kernel.steer_rules)

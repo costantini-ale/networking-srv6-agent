@@ -12,10 +12,10 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-# Not used by pip: pyproject.toml declares build-backend = "pbr.build", so
-# this file is never the build entry point. It is kept because neutron and
-# networking-bgpvpn both keep theirs, and because it makes the legacy
-# `python setup.py ...` invocations work.
+# Required: the pbr.build backend in pyproject.toml hands off to setuptools,
+# which runs this file, and pbr=True is what activates pbr. Without it the
+# build still succeeds but the wheel ships no code (pbr's package discovery
+# never runs, so only the top-level __init__.py files are packaged).
 
 import setuptools
 

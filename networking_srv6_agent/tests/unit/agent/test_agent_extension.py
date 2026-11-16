@@ -274,7 +274,7 @@ class TestApplyDomain(AgentExtensionTestCaseBase):
         self.ext._apply_domain(_payload(self.domain_id,
                                         networks=[_network()]))
         self.ext.dataplane.ensure_gateway_port.assert_called_once_with(
-            self.domain_id, 'net1', 100,
+            self.domain_id, 7, 'net1', 100,
             [{'id': 'sub1', 'cidr': '10.0.0.0/24',
               'gateway_ip': '10.0.0.1'}], mtu=1450)
 
@@ -302,7 +302,7 @@ class TestApplyDomain(AgentExtensionTestCaseBase):
         self.ext._apply_domain(_attached(self.domain_id, routes=routes,
                                         locators={'node3': 'fc00:0:3::/48'}))
         self.ext.dataplane.sync_routes.assert_called_once_with(
-            self.domain_id, routes,
+            self.domain_id, 7, routes,
             {'node2': 'fc00:0:2::/48', 'node3': 'fc00:0:3::/48'}, HOST,
             mtus={'net1': 1450}, gateway_ports={})
 
@@ -357,7 +357,7 @@ class TestApplyDomainReconciles(AgentExtensionTestCaseBase):
                                                   _network('net2')]))
         # other-net is not in this domain: its VLAN is nobody's to keep here
         self.ext.dataplane.reconcile_gateway_ports.assert_called_once_with(
-            self.domain_id, {100, 101})
+            self.domain_id, 7, {100, 101})
 
     def test_a_domain_with_no_networks_left_is_removed(self):
         """Detaching the last network removes the domain here."""
@@ -384,7 +384,7 @@ class TestApplyDomainReconciles(AgentExtensionTestCaseBase):
         self.ext._apply_domain(_payload(self.domain_id,
                                         networks=[_network('net1')]))
         self.ext.dataplane.reconcile_gateway_ports.assert_called_once_with(
-            self.domain_id, set())
+            self.domain_id, 7, set())
 
     def test_a_restart_keeps_the_gateways_of_live_networks(self):
         """The case the old early return existed for, still safe.
@@ -399,7 +399,7 @@ class TestApplyDomainReconciles(AgentExtensionTestCaseBase):
         self.ext._apply_domain(_payload(self.domain_id,
                                         networks=[_network('net1')]))
         self.ext.dataplane.reconcile_gateway_ports.assert_called_once_with(
-            self.domain_id, {100})
+            self.domain_id, 7, {100})
         # and no gateway is created before the agent has bound the network
         self.ext.dataplane.ensure_gateway_port.assert_not_called()
 
@@ -435,14 +435,14 @@ class TestApplyDomainReconciles(AgentExtensionTestCaseBase):
             _payload(self.domain_id, networks=[_network('net1')])]
         self.ext._sync_state()
         self.ext.dataplane.reconcile_gateway_ports.assert_called_once_with(
-            self.domain_id, {100})
+            self.domain_id, 7, {100})
 
     def test_the_fanout_reconciles_too(self):
         self.ext.domain_updated(
             mock.Mock(),
             domain=_payload(self.domain_id, networks=[_network('net1')]))
         self.ext.dataplane.reconcile_gateway_ports.assert_called_once_with(
-            self.domain_id, {100})
+            self.domain_id, 7, {100})
 
 
 class TestRpcHandlers(AgentExtensionTestCaseBase):
@@ -459,7 +459,7 @@ class TestRpcHandlers(AgentExtensionTestCaseBase):
     def _routes_updated(self, add=(), remove=()):
         self.ext.routes_updated(self.ext.context, domain_id=self.domain_id,
                                 add=list(add), remove=list(remove))
-        return self.ext.dataplane.sync_routes.call_args[0][1]
+        return self.ext.dataplane.sync_routes.call_args[0][2]
 
     def test_routes_updated_reconciles_the_merged_domain(self):
         # A port event takes the full-sync path, so the two cannot drift.
@@ -559,7 +559,7 @@ class TestPortEvents(AgentExtensionTestCaseBase):
         self.ext.handle_port(self.ext.context,
                              {'network_id': 'net1', 'port_id': 'p1'})
         self.ext.dataplane.ensure_gateway_port.assert_called_once_with(
-            self.domain_id, 'net1', 100,
+            self.domain_id, 7, 'net1', 100,
             [{'id': 'sub1', 'cidr': '10.0.0.0/24',
               'gateway_ip': '10.0.0.1'}], mtu=1450)
         self.assertFalse(self.cctxt.call.called)
@@ -635,8 +635,8 @@ class TestDeletePort(AgentExtensionTestCaseBase):
             'net2': {101}, 'net3': {102}}
         self._delete()
         self.assertEqual(
-            sorted([mock.call(self.domain_id, {101}),
-                    mock.call(self.other, {102})], key=str),
+            sorted([mock.call(self.domain_id, 7, {101}),
+                    mock.call(self.other, 9, {102})], key=str),
             sorted(self.ext.dataplane.reconcile_gateway_ports.call_args_list,
                    key=str))
 
@@ -1284,6 +1284,17 @@ class TestDormantDomains(AgentExtensionTestCaseBase):
                              {'network_id': 'net1', 'port_id': 'p1'})
         self.assertIn(self.domain_id, self.ext.dormant)
         self.assertNotIn(self.domain_id, self.ext.domains)
+
+    def test_a_failed_teardown_is_no_longer_programmed(self):
+        # The teardown may have flushed the seal already: such a VRF must
+        # get no gateway port, and the kernel's function id retries it.
+        self.ext.domains[self.domain_id] = _attached(self.domain_id)
+        self.ext.dataplane.delete_domain.side_effect = RuntimeError('boom')
+        self._sync(_attached(self.domain_id))
+        self.assertNotIn(self.domain_id, self.ext.domains)
+        self.ext.handle_port(self.ext.context,
+                             {'network_id': 'net1', 'port_id': 'p1'})
+        self.ext.dataplane.ensure_gateway_port.assert_not_called()
 
     def test_routes_updated_neither_programs_nor_resyncs(self):
         self._dormant()

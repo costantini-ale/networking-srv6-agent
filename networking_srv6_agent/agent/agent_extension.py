@@ -319,10 +319,12 @@ class Srv6AgentExtension(l2_extension.L2AgentExtension):
 
         It holds something if the domain is programmed here, or if the
         kernel has a VRF or SID rule of its function id: left from before a
-        restart, or by an earlier build. A failure raises, before the caller
-        changes the domain's record, so the next pass retries.
+        restart, or by an earlier build. The domain stops being programmed
+        before the teardown, so a half torn-down VRF never gets a gateway
+        port again. A failure raises: the kernel still holds the function
+        id, so the next pass retries.
         """
-        if domain_id not in self.domains and function_id not in (
+        if self.domains.pop(domain_id, None) is None and function_id not in (
                 self.dataplane.present_function_ids() or set()):
             return
         LOG.info("SRv6: %(why)s; removing the state of domain %(d)s on this "
@@ -464,7 +466,8 @@ class Srv6AgentExtension(l2_extension.L2AgentExtension):
                         "gateway ports of domain %s", domain_id)
             return
         self.dataplane.reconcile_gateway_ports(
-            domain_id, self._wanted_vlans(payload, present))
+            domain_id, payload['function_id'],
+            self._wanted_vlans(payload, present))
 
     def _reconcile_all_gateways(self):
         """Reconcile every known domain's gateway ports. Caller holds the lock.
@@ -559,10 +562,11 @@ class Srv6AgentExtension(l2_extension.L2AgentExtension):
                 continue
             self.dataplane.check_mtu(network.get('mtu'))
             self.dataplane.ensure_gateway_port(
-                domain_id, network_id, local_vlan,
+                domain_id, payload['function_id'], network_id, local_vlan,
                 network.get('subnets') or [], mtu=network.get('mtu'))
         self.dataplane.sync_routes(
-            domain_id, payload.get('routes') or [], self.locators, self.host,
+            domain_id, payload['function_id'], payload.get('routes') or [],
+            self.locators, self.host,
             mtus=self._network_mtus(payload),
             gateway_ports=self._gateway_ports(payload, vlans))
         self._forget(domain_id)
@@ -642,7 +646,8 @@ class Srv6AgentExtension(l2_extension.L2AgentExtension):
                     add or [], remove or []))
                 self.domains[domain_id] = payload
                 self.dataplane.sync_routes(
-                    domain_id, payload['routes'], self.locators, self.host,
+                    domain_id, payload['function_id'], payload['routes'],
+                    self.locators, self.host,
                     mtus=self._network_mtus(payload),
                     gateway_ports=self._gateway_ports(payload))
             except Exception:
@@ -737,7 +742,8 @@ class Srv6AgentExtension(l2_extension.L2AgentExtension):
                         continue
                     try:
                         self.dataplane.ensure_gateway_port(
-                            domain_id, network_id, local_vlan,
+                            domain_id, payload['function_id'], network_id,
+                            local_vlan,
                             network.get('subnets') or [],
                             mtu=network.get('mtu'))
                     except Exception:
