@@ -31,8 +31,8 @@ import testtools
 
 from networking_srv6_agent.common import config
 from networking_srv6_agent.db import aggregate_load_db
-from networking_srv6_agent.services import aggregates
-from networking_srv6_agent.services import plugin
+from networking_srv6_agent.services.underlay import aggregates
+from networking_srv6_agent.services.underlay import telemetry
 from networking_srv6_agent.tests.unit.services import test_plugin
 
 
@@ -56,7 +56,7 @@ class AggregateRestTestCase(test_plugin.Srv6RestTestCase):
 
     def setUp(self):
         super().setUp()
-        self.srv6.capacity = dict(CAPACITY)
+        self.srv6.underlay.capacity = dict(CAPACITY)
         self.now = T0
         clock = mock.patch('oslo_utils.timeutils.utcnow',
                            side_effect=lambda *a, **kw: self.now)
@@ -118,7 +118,7 @@ class TestIngestion(AggregateRestTestCase):
         self._post([_m(reporter='s2')], expected=400)
 
     def test_an_unknown_link_is_skipped_with_one_warning(self):
-        with mock.patch.object(plugin.LOG, 'warning') as warn:
+        with mock.patch.object(telemetry.LOG, 'warning') as warn:
             self._post([_m(), _m(a='l1', b='s1')])
             self._post([_m(), _m(a='l1', b='s1')])
         self.assertEqual(1, warn.call_count)
@@ -128,7 +128,7 @@ class TestIngestion(AggregateRestTestCase):
         self._post([_m(a='l1', b='s1')], expected=400)
 
     def test_no_topology_no_aggregate_loads(self):
-        self.srv6.capacity = {}
+        self.srv6.underlay.capacity = {}
         self._post([_m()], expected=400)
 
     def test_bad_values_are_refused(self):
@@ -365,7 +365,7 @@ class TestDomainAddresses(test_plugin.PluginUnitTestCaseBase):
         dhcp = test_plugin._port(fixed_ips=[{'ip_address': '10.91.1.2'}],
                                  device_owner=n_const.DEVICE_OWNER_DHCP)
         self.core.get_ports.return_value = [ok, unbound, down, dhcp]
-        out = self.plugin._domain_addresses(
+        out = self.plugin.domain_addresses(
             self.ctx, test_plugin._domain(networks=['net1']))
         self.assertEqual({'10.91.1.11': (ok['id'], 'OVS1'),
                           '2001:db8::1': (ok['id'], 'OVS1')}, out)
@@ -373,6 +373,6 @@ class TestDomainAddresses(test_plugin.PluginUnitTestCaseBase):
             self.ctx, filters={'network_id': ['net1']})
 
     def test_a_domain_without_networks_asks_nothing(self):
-        self.assertEqual({}, self.plugin._domain_addresses(
+        self.assertEqual({}, self.plugin.domain_addresses(
             self.ctx, test_plugin._domain()))
         self.core.get_ports.assert_not_called()

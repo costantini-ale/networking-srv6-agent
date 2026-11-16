@@ -26,7 +26,7 @@ from unittest import mock
 
 from networking_srv6_agent.common import config
 from networking_srv6_agent.services import plugin
-from networking_srv6_agent.services import te_reopt
+from networking_srv6_agent.services.underlay import reopt as te_reopt
 from networking_srv6_agent.tests.unit.services import test_link_failure
 
 LS = test_link_failure.LS
@@ -38,7 +38,7 @@ class ReoptTestCase(test_link_failure.LinkFailureTestCase):
 
     def setUp(self):
         super().setUp()
-        self.reopt = te_reopt.TeReoptimiser(self.srv6)
+        self.reopt = te_reopt.TeReoptimiser(self.srv6.underlay)
         self.t = 0
 
     def _conf(self, **kw):
@@ -54,7 +54,8 @@ class ReoptTestCase(test_link_failure.LinkFailureTestCase):
         self._at(self.t)
         items = [{'reporter': 'la', 'from_node': a, 'to_node': b, 'up': True,
                   'mbps': float(loads.get((a, b), 0)), 'drops': 0}
-                 for a, b in sorted(self.srv6.capacity) if 'la' in (a, b)]
+                 for a, b in sorted(self.srv6.underlay.capacity)
+                 if 'la' in (a, b)]
         req = self.new_create_request(LS, {LS: items}, as_admin=True)
         self._check(req.get_response(self.ext_api), 201)
 
@@ -93,12 +94,12 @@ class TestWorkers(ReoptTestCase):
         with mock.patch.object(plugin.neutron_worker, 'PeriodicWorker'):
             self.assertEqual(1, len(self.srv6.get_workers()))
         self._conf(te_auto_steering=True)
-        self.srv6.capacity = {}
+        self.srv6.underlay.capacity = {}
         with mock.patch.object(plugin.neutron_worker, 'PeriodicWorker'):
             self.assertEqual(1, len(self.srv6.get_workers()))
 
     def test_a_failing_pass_does_not_raise(self):
-        with mock.patch.object(self.srv6, '_load_series',
+        with mock.patch.object(self.srv6.underlay, 'load_series',
                                side_effect=RuntimeError('db')), \
                 mock.patch.object(te_reopt.LOG, 'exception') as exc:
             self.reopt.check()

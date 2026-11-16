@@ -38,7 +38,7 @@ class LinkFailureTestCase(test_te.TeRestTestCase):
     def setUp(self):
         super().setUp()
         self.srv6.fabric_locators = dict(test_te.FABRIC)
-        self.srv6.capacity = dict(test_te.CAPACITY)
+        self.srv6.underlay.capacity = dict(test_te.CAPACITY)
         self.now = T0
         clock = mock.patch('oslo_utils.timeutils.utcnow',
                            side_effect=lambda *a, **kw: self.now)
@@ -57,7 +57,8 @@ class LinkFailureTestCase(test_te.TeRestTestCase):
         """
         items = [{'reporter': node, 'from_node': a, 'to_node': b,
                   'up': (a, b) not in down, 'mbps': 0.0, 'drops': 0}
-                 for a, b in sorted(self.srv6.capacity) if node in (a, b)]
+                 for a, b in sorted(self.srv6.underlay.capacity)
+                 if node in (a, b)]
         req = self.new_create_request(LS, {LS: items}, as_admin=True)
         self._check(req.get_response(self.ext_api), 201)
 
@@ -102,7 +103,8 @@ class TestSilentNodes(LinkFailureTestCase):
         self._all_report(but={'s1'})
         items = [{'reporter': 's1', 'from_node': a, 'to_node': b,
                   'up': True, 'mbps': 0.0, 'drops': 0}
-                 for a, b in sorted(self.srv6.capacity) if 's1' in (a, b)]
+                 for a, b in sorted(self.srv6.underlay.capacity)
+                 if 's1' in (a, b)]
         items.append({'reporter': 's1', 'from_node': 's1', 'to_node': 'lc',
                       'up': True, 'mbps': 0.0, 'drops': 0})
         req = self.new_create_request(LS, {LS: items}, as_admin=True)

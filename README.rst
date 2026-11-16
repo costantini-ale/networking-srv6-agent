@@ -62,98 +62,12 @@ Each node announces its **locator** (an IPv6 prefix, e.g. ``fc00:0:1::/48``);
 a domain's SID on that node is the locator plus the domain's function id.
 
 
-Requirements
-------------
+Deploying
+---------
 
-- **ML2/OVS with VXLAN tunnels.** The agent side is an extension of the OVS
-  L2 agent. ML2/OVN (no L2 agent) and linuxbridge are not supported.
-- Linux kernel with ``CONFIG_IPV6_SEG6_LWTUNNEL`` and the ``vrf`` module
-  (on Ubuntu cloud images: ``linux-modules-extra``). For ``usid``: kernel and
-  iproute2 >= 6.1.
-- An **IPv6-routable underlay** between all nodes: each node's locator must
-  be reachable from every other node. With ``usid`` all locators are /48 in
-  one /32 block.
-- Python >= 3.11, Neutron of the same release.
-
-
-Deploying with DevStack
------------------------
-
-**Quickest way: the test lab.** ``lab/lab.sh up`` builds a complete
-multi-node DevStack with the plugin (on VMs it creates, or on your own
-machines), sets up the IPv6 underlay, optionally a spine-leaf fabric with the
-telemetry agents, and runs a smoke test. See ``lab/README.rst``. The rest of
-this section is what it does, for your own deployment.
-
-Enable the plugin in ``local.conf`` on **every** node (controller and
-computes). It installs the package, enables the service plugin and the agent
-extension, writes the options into ``neutron.conf`` /
-``ml2_conf.ini``, runs the DB migrations (through ``neutron-db-manage``) and,
-if Horizon is enabled, installs the panels.
-
-Controller (all-in-one or API node)::
-
-    [[local|localrc]]
-    Q_AGENT=openvswitch
-    Q_ML2_PLUGIN_MECHANISM_DRIVERS=openvswitch,l2population
-    Q_ML2_TENANT_NETWORK_TYPE=vxlan
-    Q_ML2_PLUGIN_TYPE_DRIVERS=flat,vlan,vxlan,local
-    enable_service q-svc q-agt q-dhcp q-l3 q-meta
-    disable_service ovn-controller ovn-northd q-ovn-metadata-agent
-
-    enable_plugin networking-srv6-agent https://github.com/costa99/networking-srv6-agent.git main
-    SRV6_LOCATOR=fc00:0:1::/48        # unique per node
-
-Compute node::
-
-    [[local|localrc]]
-    SERVICE_HOST=<controller IP>
-    disable_all_services
-    enable_service n-cpu q-agt placement-client
-    Q_AGENT=openvswitch
-    Q_ML2_PLUGIN_MECHANISM_DRIVERS=openvswitch,l2population
-    Q_ML2_TENANT_NETWORK_TYPE=vxlan
-    Q_TUNNEL_TYPES=vxlan
-
-    enable_plugin networking-srv6-agent https://github.com/costa99/networking-srv6-agent.git main
-    SRV6_LOCATOR=fc00:0:2::/48
-
-DevStack variables (defaults in ``devstack/settings``):
-
-=============================  ==========================  ================================
-Variable                       Default                     Meaning
-=============================  ==========================  ================================
-``SRV6_LOCATOR``               *(required on q-agt)*       This node's locator; unique per
-                                                           node. Stack fails without it.
-``SRV6_UNDERLAY_INTERFACE``    auto                        NIC of the IPv6 underlay. Unset:
-                                                           found from the route to each
-                                                           peer's locator.
-``SRV6_DATAPLANE_ENCODING``    ``usid``                    ``usid`` or ``encap`` (server).
-``SRV6_FUNCTION_ID_RANGES``    ``0xe000:0xefff``           Pool of domain function ids
-                                                           (server); must stay in this
-                                                           range.
-``SRV6_TOPOLOGY_FILE``         *(unset)*                   Underlay topology for link state
-                                                           and automatic steering (server).
-``SRV6_VRF_TABLE_BASE``        ``0``                       VRF table = base + function id.
-                                                           Same value on every node.
-``SRV6_RESYNC_INTERVAL``       ``300``                     Seconds between full agent
-                                                           resyncs.
-``SRV6_DASHBOARD_ENABLE``      all panels                  Horizon panel files to install.
-=============================  ==========================  ================================
-
-The underlay is your job: give every node an IPv6 address and routes so that
-``ping6`` to each other node's locator address works before stacking.
-
-Check the deployment::
-
-    openstack network agent list          # OVS agents alive on every node
-    openstack srv6 locator list           # one locator per node (admin)
-    openstack extension list | grep -i srv6
-
-Without DevStack, the same result is: ``service_plugins = ...,srv6`` and a
-``[srv6]`` section in ``neutron.conf``; ``extensions = srv6`` under
-``[agent]`` and a ``[srv6_agent]`` section with ``locator`` in the OVS agent's
-config; then ``neutron-db-manage upgrade heads``.
+ML2/OVS with VXLAN, a Linux kernel with SRv6 and VRF support, and an IPv6
+underlay between the nodes. ``DEPLOYMENT.rst`` lists the requirements, the
+DevStack settings and a worked three-node example.
 
 
 Using it
@@ -235,38 +149,15 @@ computation** (CSPF: fewest hops over links with room, then the widest
 bottleneck) and released when the pair goes idle or the link has room
 again. Manual TE paths never use it: their waypoints are the ones you give.
 
-What is needed:
+It needs a topology file on the controller (without it, link state is
+disabled and fabric nodes cannot be waypoints) and the telemetry agent on
+every fabric switch (without it there is nothing to measure, so the server
+never steers anything). How to set both up: the fabric section of
+``DEPLOYMENT.rst``. Watch it::
 
-- a topology file: without it, link state is disabled and fabric nodes cannot
-  be waypoints;
-- the fabric agents: without them there is nothing to measure, so the server
-  never steers anything (it stays idle, no error).
-
-1. Write a topology file on the controller and set ``SRV6_TOPOLOGY_FILE``
-   (or ``[srv6] topology_file``)::
-
-       node spine1 fc00:0:101::/48
-       node leaf1  fc00:0:111::/48
-       node node1  fc00:0:1::/48      # hosts use their Neutron host name
-       link leaf1 spine1 10000        # capacity per direction, Mbit/s
-       link node1 leaf1  10000
-
-2. Run the telemetry agent on each fabric switch (Linux)::
-
-       tools/srv6-fabric-agent.py --links links.txt --period 5 \
-           --neutron-url <neutron endpoint> --credentials admin-openrc \
-           --aggregates
-
-   ``links.txt`` has one line per neighbour: ``<interface> <this node>
-   <neighbour>``. ``--neutron-url`` is the network endpoint
-   (``openstack endpoint list --service network``). ``srv6-fabric-agent.py
-   test`` runs a self-check.
-
-3. Watch it::
-
-       openstack srv6 link list --long        # load per link, stale flag
-       openstack srv6 aggregate list --long   # heavy VM pairs per link
-       openstack srv6 te path list --long     # origin=auto: steered by server
+    openstack srv6 link list --long        # load per link, stale flag
+    openstack srv6 aggregate list --long   # heavy VM pairs per link
+    openstack srv6 te path list --long     # origin=auto: steered by server
 
 Thresholds and limits are the ``te_reopt_*`` and ``te_auto_*`` options in
 ``[srv6]`` (``oslo-config-generator`` lists them all with help text).

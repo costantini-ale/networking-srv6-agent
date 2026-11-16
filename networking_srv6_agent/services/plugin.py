@@ -32,7 +32,6 @@ would then run inside the transaction and agents could be told about state
 that later rolls back.
 """
 
-import collections
 import datetime
 import ipaddress
 
@@ -62,22 +61,17 @@ from networking_srv6_agent.api.definitions import srv6_te as te_def
 from networking_srv6_agent.common import config
 from networking_srv6_agent.common import constants
 from networking_srv6_agent.common import sid
-from networking_srv6_agent.db import aggregate_load_db
 from networking_srv6_agent.db import domain_db
 from networking_srv6_agent.db import link_state_db
 from networking_srv6_agent.db import srv6_db
 from networking_srv6_agent.db import te_db
 from networking_srv6_agent.extensions import srv6 as srv6_ext
-from networking_srv6_agent.extensions import srv6_aggregate_loads as \
-    ag_ext
-from networking_srv6_agent.extensions import srv6_link_states as ls_ext
 from networking_srv6_agent.extensions import srv6_te as te_ext
-from networking_srv6_agent.services import aggregates
 from networking_srv6_agent.services import pce
 from networking_srv6_agent.services import rpc
 from networking_srv6_agent.services import te_liveness
-from networking_srv6_agent.services import te_reopt
 from networking_srv6_agent.services import te_resolver
+from networking_srv6_agent.services.underlay import telemetry
 
 
 LOG = logging.getLogger(__name__)
@@ -85,11 +79,6 @@ LOG = logging.getLogger(__name__)
 
 def _prefix_for(address):
     return '%s/%d' % (address, 128 if ':' in address else 32)
-
-
-# Seconds by which a VM-pair row may precede its reporter's newest link-state
-# row and still belong to the same report (_aggregate_view).
-AGGREGATE_HEARTBEAT_SLACK = 2
 
 
 def _route_for(port, address, host):
@@ -135,10 +124,6 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
         self.conf = cfg.CONF[config.SRV6_SERVER_GROUP]
         self.agent_rpc = rpc.Srv6AgentNotifyAPI()
         self._pool_synced = False
-        # (reporter, link) already warned about by _add_link_states
-        self._unknown_links = set()
-        # (reporter, link) already warned about by _add_aggregate_loads
-        self._unknown_aggregate_links = set()
         # port id -> the domains of its source-VM paths, between the
         # BEFORE_DELETE and AFTER_DELETE of that port
         self._deleting_source_ports = {}
@@ -152,25 +137,21 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                   'enc': self.encoding})
 
     def _load_topology(self):
-        """The underlay for link state and automatic steering, read once.
+        """The topology file, read once.
 
-        fabric_locators {node: locator} and capacity {(a, b): Mbit/s}, empty
-        without [srv6] topology_file.
+        fabric_locators {node: locator} for fabric waypoints, empty
+        without [srv6] topology_file; its link capacities go to the
+        Underlay, the measured link state.
         """
-        if not 0 < self.conf.te_reopt_low < self.conf.te_reopt_high:
-            raise n_exc.InvalidConfigurationOption(
-                opt_name='[srv6] te_reopt_low/te_reopt_high',
-                opt_value='%s/%s (need 0 < low < high)' % (
-                    self.conf.te_reopt_low, self.conf.te_reopt_high))
-        self.fabric_locators, self.capacity = {}, {}
-        if not self.conf.topology_file:
-            return
-        try:
-            self.fabric_locators, self.capacity = pce.load(
-                self.conf.topology_file)
-        except (OSError, pce.TopologyError) as e:
-            raise n_exc.InvalidConfigurationOption(
-                opt_name='[srv6] topology_file', opt_value=str(e))
+        self.fabric_locators, capacity = {}, {}
+        if self.conf.topology_file:
+            try:
+                self.fabric_locators, capacity = pce.load(
+                    self.conf.topology_file)
+            except (OSError, pce.TopologyError) as e:
+                raise n_exc.InvalidConfigurationOption(
+                    opt_name='[srv6] topology_file', opt_value=str(e))
+        self.underlay = telemetry.Underlay(self.conf, capacity, self)
 
     @property
     def usid(self):
@@ -681,227 +662,32 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
     # measured link state
     # ------------------------------------------------------------------
     def create_srv6_link_state_bulk(self, context, srv6_link_states):
-        return self._add_link_states(
-            context, [item[ls_def.RESOURCE_NAME]
-                      for item in srv6_link_states[ls_def.COLLECTION_NAME]])
+        return self.underlay.create_srv6_link_state_bulk(context,
+                                                         srv6_link_states)
 
     def create_srv6_link_state(self, context, srv6_link_state):
-        return self._add_link_states(
-            context, [srv6_link_state[ls_def.RESOURCE_NAME]])[0]
-
-    def _add_link_states(self, context, items):
-        """Validate and store one batch of measurements, whole or not at all.
-
-        Every item must be measured by one of its link's two ends, at most
-        once per batch; mbps and drops are null or a non-negative finite
-        number (the collector's data moves traffic, so nothing else is
-        trusted). The server's clock stamps the batch, and the batch deletes
-        its reporters' rows older than two windows.
-
-        An item for a link the topology file does not have is skipped, with
-        one WARNING per reporter and link, and the rest is stored: refusing
-        the batch would leave its reporter silent, which reads as a dead
-        node and sends every TE path through it direct. A batch with
-        no known link at all is refused.
-        """
-        if not self.capacity:
-            raise ls_ext.Srv6LinkStateInvalid(
-                reason=_("link state needs an underlay topology "
-                         "([srv6] topology_file)"))
-        rows, seen, unknown = [], set(), []
-        for item in items:
-            row = {k: item[k] for k in ('reporter', 'from_node', 'to_node',
-                                        'up', 'mbps', 'drops')}
-            link = (row['from_node'], row['to_node'])
-            name = '%s>%s' % link
-            if link not in self.capacity:
-                unknown.append(name)
-                if (row['reporter'], link) not in self._unknown_links:
-                    self._unknown_links.add((row['reporter'], link))
-                    LOG.warning("SRv6 link state: %(r)s reports %(l)s, which "
-                                "is not a link of the underlay topology "
-                                "(%(f)s); ignoring it, storing the rest",
-                                {'r': row['reporter'], 'l': name,
-                                 'f': self.conf.topology_file})
-                continue
-            if row['reporter'] not in link:
-                raise ls_ext.Srv6LinkStateInvalid(
-                    reason=_("reporter %(r)s is not an end of %(l)s")
-                    % {'r': row['reporter'], 'l': name})
-            if (row['reporter'], link) in seen:
-                raise ls_ext.Srv6LinkStateInvalid(
-                    reason=_("%(r)s reported %(l)s twice")
-                    % {'r': row['reporter'], 'l': name})
-            seen.add((row['reporter'], link))
-            # 1e7 Mbit/s = 10 Tbit/s: no link carries more; also NaN/inf
-            for attr, kinds, top in (('mbps', (int, float), 1e7),
-                                     ('drops', (int,), 2 ** 63)):
-                v = row[attr]
-                if v is not None and (isinstance(v, bool) or
-                                      not isinstance(v, kinds) or
-                                      not 0 <= v < top):
-                    raise ls_ext.Srv6LinkStateInvalid(
-                        reason=_("%(a)s of %(l)s must be null or a number "
-                                 "from 0 to %(t)g") %
-                        {'a': attr, 'l': name, 't': top})
-            rows.append(row)
-        if not rows:
-            raise ls_ext.Srv6LinkStateInvalid(
-                reason=_("%s: not a link of the underlay topology")
-                % ', '.join(unknown))
-        # whole seconds: MySQL DATETIME rounds the fraction, which could
-        # store a measurement up to half a second in the future
-        now = timeutils.utcnow().replace(microsecond=0)
-        link_state_db.add_link_states(
-            context, rows, now, now - datetime.timedelta(
-                seconds=2 * self.conf.link_state_window))
-        return [dict(r, id='%s:%s' % (r['from_node'], r['to_node']),
-                     measured_at=now.isoformat()) for r in rows]
-
-    @staticmethod
-    def _history(context):
-        """{(from, to, reporter): [row, ...]}, each oldest first."""
-        hist = collections.defaultdict(list)
-        for r in link_state_db.get_link_states(context):   # oldest first
-            hist[(r.from_node, r.to_node, r.reporter)].append(r)
-        return hist
-
-    @staticmethod
-    def _ends(hist, a, b, fresh):
-        """(ends, live) of the directed link a -> b.
-
-        ends: the histories of the ends that reported it, the sender's
-        (a's) first; live: those with a measurement since fresh. live[0]
-        is the end that counts -- the sender if fresh, else the receiver
-        -- for the view (admission, the API) and the re-optimisation alike.
-        """
-        ends = [h for h in (hist.get((a, b, a)), hist.get((a, b, b))) if h]
-        return ends, [h for h in ends if h[-1].measured_at >= fresh]
-
-    def _link_state_view(self, context, hist=None):
-        """{(from, to): entry} of every link of the topology file.
-
-        hist: a _history already read (the re-optimisation reads it once
-        per pass); None reads it now.
-
-        capacity_mbps is the file's capacity, shown next to what is
-        measured (U-a). A link nobody has reported yet has null
-        measurements and stale=true.
-
-        Per directed link, the sender's measurement is the load (what was
-        offered to the link) and the receiver's is what got through
-        (delivered_mbps); a link only one end reports (leaf-host) has just
-        that one. mbps comes from the sender if it is fresh, else from the
-        receiver if fresh, else from whichever is newer (then stale). A
-        measurement is fresh for link_state_stale_after seconds;
-        peak_mbps is the highest mbps of that end in link_state_window.
-        up is False if a fresh report from either end says so (a silent
-        node is _silent_fabric's).
-        """
-        now = timeutils.utcnow()
-        fresh = now - datetime.timedelta(
-            seconds=self.conf.link_state_stale_after)
-        start = now - datetime.timedelta(seconds=self.conf.link_state_window)
-        hist = self._history(context) if hist is None else hist
-        view = {}
-        for a, b in sorted(self.capacity):
-            entry = {'id': '%s:%s' % (a, b), 'from_node': a, 'to_node': b,
-                     'capacity_mbps': self.capacity[(a, b)]}
-            view[(a, b)] = entry
-            ends, live = self._ends(hist, a, b, fresh)
-            if not ends:
-                entry.update(dict.fromkeys(
-                    ('reporter', 'up', 'mbps', 'drops', 'delivered_mbps',
-                     'peak_mbps', 'measured_at', 'age')), stale=True)
-                continue
-            main = live[0] if live else max(
-                ends, key=lambda h: h[-1].measured_at)
-            last = main[-1]
-            rx = hist.get((a, b, b))
-            entry.update({
-                'reporter': last.reporter,
-                'up': (all(h[-1].up for h in live) if live
-                       else last.up),
-                'mbps': last.mbps,
-                'drops': last.drops,
-                'delivered_mbps': (rx[-1].mbps if rx and
-                                   rx[-1].measured_at >= fresh else None),
-                'peak_mbps': max((r.mbps for r in main
-                                  if r.measured_at > start and
-                                  r.mbps is not None), default=None),
-                'measured_at': last.measured_at.isoformat(),
-                'age': int((now - last.measured_at).total_seconds()),
-                'stale': not live,
-            })
-        return view
+        return self.underlay.create_srv6_link_state(context, srv6_link_state)
 
     def get_srv6_link_states(self, context, filters=None, fields=None,
                              sorts=None, limit=None, marker=None,
                              page_reverse=False):
-        filters = filters or {}
-        return [_only(entry, fields)
-                for entry in self._link_state_view(context).values()
-                if all(entry[k] in filters[k]
-                       for k in ('id', 'from_node', 'to_node')
-                       if filters.get(k))]
+        return self.underlay.get_srv6_link_states(context, filters, fields)
 
     def get_srv6_link_state(self, context, id, fields=None):
-        entry = self._link_state_view(context).get(tuple(id.split(':', 1)))
-        if entry is None:
-            raise ls_ext.Srv6LinkStateNotFound(id=id)
-        return _only(entry, fields)
+        return self.underlay.get_srv6_link_state(context, id, fields)
 
     # ------------------------------------------------------------------
     # measured load per VM pair and link
     # ------------------------------------------------------------------
     def create_srv6_aggregate_load_bulk(self, context, srv6_aggregate_loads):
-        return self._add_aggregate_loads(
-            context, [item[ag_def.RESOURCE_NAME] for item in
-                      srv6_aggregate_loads[ag_def.COLLECTION_NAME]])
+        return self.underlay.create_srv6_aggregate_load_bulk(
+            context, srv6_aggregate_loads)
 
     def create_srv6_aggregate_load(self, context, srv6_aggregate_load):
-        return self._add_aggregate_loads(
-            context, [srv6_aggregate_load[ag_def.RESOURCE_NAME]])[0]
+        return self.underlay.create_srv6_aggregate_load(
+            context, srv6_aggregate_load)
 
-    def _add_aggregate_loads(self, context, items):
-        """Validate and store one batch of VM-pair loads, whole or not at all.
-
-        aggregates.check_batch says what is refused. Items on a link the
-        topology file does not have are skipped with one WARNING per
-        reporter and link, as for link states; a batch with no known link
-        is refused. Stamped with the server's clock; the batch deletes its
-        reporter's rows older than two link_state_window.
-        """
-        if not self.capacity:
-            raise ag_ext.Srv6AggregateLoadInvalid(
-                reason=_("aggregate loads need an underlay topology "
-                         "([srv6] topology_file)"))
-        try:
-            rows, unknown = aggregates.check_batch(items, self.capacity)
-        except aggregates.Invalid as e:
-            raise ag_ext.Srv6AggregateLoadInvalid(reason=str(e))
-        for link in unknown:
-            reporter = link[0]
-            if (reporter, link) not in self._unknown_aggregate_links:
-                self._unknown_aggregate_links.add((reporter, link))
-                LOG.warning("SRv6 aggregate load: %(r)s reports %(l)s, "
-                            "which is not a link of the underlay topology "
-                            "(%(f)s); ignoring it, storing the rest",
-                            {'r': reporter, 'l': '%s>%s' % link,
-                             'f': self.conf.topology_file})
-        if not rows:
-            raise ag_ext.Srv6AggregateLoadInvalid(
-                reason=_("%s: not a link of the underlay topology") %
-                ', '.join(sorted({'%s>%s' % link for link in unknown})))
-        # whole seconds, as _add_link_states (MySQL rounds the fraction)
-        now = timeutils.utcnow().replace(microsecond=0)
-        aggregate_load_db.add_aggregate_loads(
-            context, rows, now, now - datetime.timedelta(
-                seconds=2 * self.conf.link_state_window))
-        return [dict(r, id=aggregates.entry_id(r),
-                     measured_at=now.isoformat()) for r in rows]
-
-    def _domain_addresses(self, admin_context, domain):
+    def domain_addresses(self, admin_context, domain):
         """{address: (port id, host)} of a domain's bound workload ports.
 
         The same ports _routes_for_domain advertises (_port_is_relevant),
@@ -924,56 +710,13 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                                                                host)
         return out
 
-    def _aggregate_view(self, context):
-        """[entry] of every VM pair measured on a link and still fresh.
-
-        Fresh = within link_state_stale_after, the link states' rule; the
-        peak is over link_state_window. The domain, ports and hosts are
-        resolved now, from today's ports: a pair whose VM has gone keeps
-        its rate with null ports.
-        """
-        now = timeutils.utcnow()
-        fresh = now - datetime.timedelta(
-            seconds=self.conf.link_state_stale_after)
-        start = now - datetime.timedelta(seconds=self.conf.link_state_window)
-        rows = aggregate_load_db.get_aggregate_loads(context,
-                                                     min(fresh, start))
-        if not rows:
-            return []
-        admin_context = context.elevated()
-        domains = []
-        for domain in domain_db.get_domains(admin_context):
-            function_id = srv6_db.get_function_id(admin_context,
-                                                  domain['id'])
-            if function_id is not None:
-                domains.append((domain, function_id))
-        resolve = aggregates.Resolver(
-            domains, srv6_db.get_host_locators(admin_context), self.usid,
-            lambda domain: self._domain_addresses(admin_context, domain))
-        # The link-state batch every agent posts each period is the
-        # heartbeat: a pair row older than its reporter's last one has left
-        # the link. AGGREGATE_HEARTBEAT_SLACK: both POSTs of one period are
-        # stamped in whole seconds, the pairs' just after the links'.
-        current = {reporter: seen - datetime.timedelta(
-            seconds=AGGREGATE_HEARTBEAT_SLACK) for reporter, seen in
-            link_state_db.get_last_seen(context).items()}
-        return aggregates.view(rows, now, fresh, start, resolve, current)
-
     def get_srv6_aggregate_loads(self, context, filters=None, fields=None,
                                  sorts=None, limit=None, marker=None,
                                  page_reverse=False):
-        filters = filters or {}
-        return [_only(entry, fields)
-                for entry in self._aggregate_view(context)
-                if all(entry[k] in filters[k]
-                       for k in ('id', 'from_node', 'to_node', 'domain_id')
-                       if filters.get(k))]
+        return self.underlay.get_srv6_aggregate_loads(context, filters, fields)
 
     def get_srv6_aggregate_load(self, context, id, fields=None):
-        for entry in self._aggregate_view(context):
-            if entry['id'] == id:
-                return _only(entry, fields)
-        raise ag_ext.Srv6AggregateLoadNotFound(id=id)
+        return self.underlay.get_srv6_aggregate_load(context, id, fields)
 
     def _check_capabilities(self, host, capabilities):
         """Name a node that cannot honour dataplane_encoding. Logs only.
@@ -1046,7 +789,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
         hiccup.
 
         Fabric nodes (spines, leaves) run no agent: one is dead when its
-        link-state reports stopped (_silent_fabric), so an operator
+        link-state reports stopped (silent_fabric), so an operator
         path through a dead spine goes DEGRADED too. The two sources are
         read apart: either failing leaves the other's answer.
         """
@@ -1067,7 +810,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
             LOG.exception("SRv6: cannot read agent liveness; treating "
                           "every TE waypoint as alive")
         try:
-            dead.update(self._silent_fabric(admin_context)[0])
+            dead.update(self.silent_fabric(admin_context)[0])
         except Exception:
             LOG.exception("SRv6: cannot read the fabric link state; "
                           "treating every fabric node as alive")
@@ -1107,11 +850,10 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
         return self._resolver(locators, dead_hosts).attach(
             domain_id, routes, paths, vms)
 
-    def _destination_of(self, admin_context, path):
-        """The compute host a path's traffic is headed for, or None."""
-        port_id = path.get(te_def.DESTINATION_PORT_ID)
+    def host_of_port(self, admin_context, port_id):
+        """The compute host a port is bound to, or None."""
         if not port_id:
-            return path.get(te_def.DESTINATION_HOST)
+            return None
         try:
             port = self._core_plugin().get_port(admin_context, port_id)
         except n_exc.PortNotFound:
@@ -1122,8 +864,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                          dead_hosts=()):
         """Resolver.resolve, with the bindings of the path's ports read."""
         bindings = {
-            port_id: self._destination_of(
-                context.elevated(), {te_def.DESTINATION_PORT_ID: port_id})
+            port_id: self.host_of_port(context.elevated(), port_id)
             for port_id in (path.get(te_def.DESTINATION_PORT_ID),
                             path.get(te_def.SOURCE_PORT_ID)) if port_id}
         return self._resolver(locators, dead_hosts).resolve(
@@ -1241,7 +982,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
     # ------------------------------------------------------------------
     # failures of the underlay
     # ------------------------------------------------------------------
-    def _silent_fabric(self, context):
+    def silent_fabric(self, context):
         """(fabric nodes down, outage) from the link-state reporters.
 
         A node that has posted link state and has posted nothing for
@@ -1260,51 +1001,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
             return frozenset(), True
         return silent, False
 
-    def _dead_links(self, context, silent, view=None):
-        """The directed topology links down now.
-
-        Reported down by a fresh end (or last seen down), or touching a
-        silent node. view: a _link_state_view already read.
-        """
-        view = self._link_state_view(context) if view is None else view
-        return frozenset(link for link, entry in view.items()
-                         if entry['up'] is False or
-                         not silent.isdisjoint(link))
-
-    def _measured_load(self, context, view=None):
-        """{(a, b): Mbit/s}: each fresh link's peak in link_state_window.
-
-        What a link holds when automatic steering looks for room. A
-        stale link is not here: it counts as empty. view: a
-        _link_state_view already read.
-        """
-        view = self._link_state_view(context) if view is None else view
-        # whole Mbit/s, the unit of the capacities: idle
-        # links' control chatter (~0.03) counts as 0, so equal paths still
-        # tie and the choice stays deterministic
-        return {link: round(entry['peak_mbps'])
-                for link, entry in view.items()
-                if not entry['stale'] and entry['peak_mbps'] is not None}
-
-    def _load_series(self, context, hist=None):
-        """{(a, b): [(measured_at, mbps), ...]} oldest first, per link.
-
-        The same end as the view's mbps: the sender's (offered load) if
-        fresh, else the receiver's if fresh; a link with neither is not
-        here. What the re-optimisation judges congestion on. hist: as in
-        _link_state_view.
-        """
-        fresh = timeutils.utcnow() - datetime.timedelta(
-            seconds=self.conf.link_state_stale_after)
-        hist = self._history(context) if hist is None else hist
-        series = {}
-        for a, b in self.capacity:
-            _ends, live = self._ends(hist, a, b, fresh)
-            if live:
-                series[(a, b)] = [(r.measured_at, r.mbps) for r in live[0]]
-        return series
-
-    def _place_auto_path(self, context, pair, node_path, existing=None):
+    def place_auto_path(self, context, pair, node_path, existing=None):
         """Create, or move, the server's own path for one VM pair.
 
         pair: one aggregate-view entry
@@ -1339,7 +1036,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
             self._push_domain_by_id(context, pair['domain_id'])
         return path
 
-    def _release_auto_path(self, context, path):
+    def release_auto_path(self, context, path):
         """Delete one auto path: its pair's traffic goes back to ECMP."""
         gone = te_db.delete_te_path(context, path['id'])
         if gone is not None:
@@ -1685,18 +1382,18 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
     # agent -> server
     # ------------------------------------------------------------------
     def get_workers(self):
-        """The TE liveness monitor and the TE re-optimisation, one each.
+        """The TE liveness monitor and the underlay's workers, one each.
 
         Neutron starts every worker with worker_process_count 0 as a thread
         of one extra process, so a node that dies is noticed and pushed once,
-        and a congested link handled once, not once per API worker. Each
-        starts only when its interval is not 0; the re-optimisation also
-        needs a topology_file and te_auto_steering.
+        and a congested link handled once, not once per API worker. The
+        monitor starts only when its interval is not 0; Underlay.workers
+        says when the re-optimisation starts.
 
         The liveness monitor's first pass waits half of agent_down_time,
         like Neutron's own agent status check: right after a server restart
         the agents have not yet reported, and a late heartbeat must not read
-        as a death. The re-optimisation's first pass waits one interval.
+        as a death.
         """
         workers = []
         interval = self.conf.te_liveness_interval
@@ -1706,12 +1403,7 @@ class Srv6Plugin(srv6_ext.Srv6PluginBase):
                 monitor.check, interval,
                 max(cfg.CONF.agent_down_time // 2, 1),
                 desc='srv6-te-liveness'))
-        interval = self.conf.te_reopt_interval
-        if interval and self.capacity and self.conf.te_auto_steering:
-            reopt = te_reopt.TeReoptimiser(self)
-            workers.append(neutron_worker.PeriodicWorker(
-                reopt.check, interval, interval, desc='srv6-te-reopt'))
-        return workers
+        return workers + self.underlay.workers()
 
     def start_rpc_listeners(self):
         """Serve sync_state. Called by neutron's RPC worker at startup.

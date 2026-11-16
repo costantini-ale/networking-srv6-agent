@@ -25,7 +25,7 @@ from unittest import mock
 
 from networking_srv6_agent.common import config
 from networking_srv6_agent.db import link_state_db
-from networking_srv6_agent.services import plugin
+from networking_srv6_agent.services.underlay import telemetry
 from networking_srv6_agent.tests.unit.services import test_plugin
 
 
@@ -44,7 +44,7 @@ class LinkStateRestTestCase(test_plugin.Srv6RestTestCase):
 
     def setUp(self):
         super().setUp()
-        self.srv6.capacity = dict(CAPACITY)
+        self.srv6.underlay.capacity = dict(CAPACITY)
         self.now = T0
         clock = mock.patch('oslo_utils.timeutils.utcnow',
                            side_effect=lambda *a, **kw: self.now)
@@ -105,7 +105,7 @@ class TestIngestion(LinkStateRestTestCase):
     def test_an_unknown_link_is_skipped_and_the_rest_stored(self):
         # a link map one line ahead of topology_file must not silence the
         # node: a silent node reads as dead (L8)
-        with mock.patch.object(plugin.LOG, 'warning') as warn:
+        with mock.patch.object(telemetry.LOG, 'warning') as warn:
             res = self._post(self._l1_batch() + [_m('l1', 'l1', 's2')])[LS]
             self._post(self._l1_batch() + [_m('l1', 'l1', 's2')])
         self.assertEqual({'l1:s1', 's1:l1'}, {r['id'] for r in res})
@@ -143,7 +143,7 @@ class TestIngestion(LinkStateRestTestCase):
         self._post([dict(_m('l1', 'l1', 's1'), t=1793570523.3)], 400)
 
     def test_no_topology_no_link_state(self):
-        self.srv6.capacity = {}
+        self.srv6.underlay.capacity = {}
         res = self._post(self._l1_batch(), 400)
         self.assertIn('topology_file', res['NeutronError']['message'])
 
@@ -188,12 +188,13 @@ class TestView(LinkStateRestTestCase):
         self._post([_m('s1', 'l1', 's1', 100.0), _m('s1', 's1', 'l1', 61.0)])
         self._at(5)
         self._post(self._l1_batch(tx=120.0, rx=40.0))
-        hist = self.srv6._history(self.admin_ctx)
-        self.assertEqual(self.srv6._link_state_view(self.admin_ctx),
-                         self.srv6._link_state_view(self.admin_ctx, hist))
-        self.assertEqual(self.srv6._load_series(self.admin_ctx),
-                         self.srv6._load_series(self.admin_ctx, hist))
-        series = self.srv6._load_series(self.admin_ctx, hist)
+        underlay = self.srv6.underlay
+        hist = underlay.history(self.admin_ctx)
+        self.assertEqual(underlay.link_state_view(self.admin_ctx),
+                         underlay.link_state_view(self.admin_ctx, hist))
+        self.assertEqual(underlay.load_series(self.admin_ctx),
+                         underlay.load_series(self.admin_ctx, hist))
+        series = underlay.load_series(self.admin_ctx, hist)
         self.assertEqual([150.0, 120.0], [m for _t, m in series[('l1', 's1')]])
 
     def test_a_link_one_end_reports_has_that_end_only(self):

@@ -848,7 +848,7 @@ class TestTopologyApi(TeRestTestCase):
     def setUp(self):
         super().setUp()
         self.srv6.fabric_locators = dict(FABRIC)
-        self.srv6.capacity = dict(CAPACITY)
+        self.srv6.underlay.capacity = dict(CAPACITY)
 
     def test_an_operator_path_may_name_a_fabric_node(self):
         path = self._host_path(via_hosts=['s2'])
@@ -871,7 +871,7 @@ class TestTopologyApi(TeRestTestCase):
                     f.write('link %s %s %d\n' % (a, b, mbps))
         self.config(group=config.SRV6_SERVER_GROUP, topology_file=path)
         self.srv6._load_topology()
-        self.assertEqual(CAPACITY, self.srv6.capacity)
+        self.assertEqual(CAPACITY, self.srv6.underlay.capacity)
         self.assertEqual(FABRIC, {n: loc for n, loc in
                                   self.srv6.fabric_locators.items()
                                   if n in FABRIC})

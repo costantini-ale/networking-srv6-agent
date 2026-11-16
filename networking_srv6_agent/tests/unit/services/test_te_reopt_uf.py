@@ -29,7 +29,7 @@ from networking_srv6_agent.api.definitions import srv6_te as te_def
 from networking_srv6_agent.db import link_state_db
 from networking_srv6_agent.db import te_db
 from networking_srv6_agent.services import pce
-from networking_srv6_agent.services import te_reopt
+from networking_srv6_agent.services.underlay import reopt as te_reopt
 from networking_srv6_agent.tests.unit.services import test_te_reopt
 
 S1, S2 = test_te_reopt.S1, test_te_reopt.S2
@@ -41,7 +41,7 @@ class SteerTestCase(test_te_reopt.ReoptTestCase):
     def setUp(self):
         super().setUp()
         self.pairs = []
-        view = mock.patch.object(self.srv6, '_aggregate_view',
+        view = mock.patch.object(self.srv6.underlay, 'aggregate_view',
                                  side_effect=lambda ctx: list(self.pairs))
         view.start()
         self.addCleanup(view.stop)
@@ -274,7 +274,7 @@ class TestHoldDownAndMoves(SteerTestCase):
         self.pairs = []
         self._pair(0, 1, 50, links=(S2,))
         self._pair(2, 3, 40, links=(S2,))
-        with mock.patch.object(self.srv6, '_place_auto_path') as place:
+        with mock.patch.object(self.srv6, 'place_auto_path') as place:
             self._samples(3, {S2: 95})
             self.reopt.check()
         for call in place.call_args_list:
@@ -370,7 +370,7 @@ class TestRelease(SteerTestCase):
         self._pair(0, 1, 50)
         self._pair(2, 3, 40)
         self._congest_s1()
-        with mock.patch.object(self.srv6, '_place_auto_path',
+        with mock.patch.object(self.srv6, 'place_auto_path',
                                return_value=None) as place:
             self.reopt.check()
         self.assertNotIn(self.vms[0], [c[0][1]['source_port_id']
@@ -417,7 +417,8 @@ class TestSharedLinks(SteerTestCase):
             items = [{'reporter': 's1', 'from_node': a, 'to_node': b,
                       'up': True, 'drops': 0,
                       'mbps': float(mbps) if (a, b) == self.S1B else 0.0}
-                     for a, b in sorted(self.srv6.capacity) if a == 's1']
+                     for a, b in sorted(self.srv6.underlay.capacity)
+                     if a == 's1']
             req = self.new_create_request(test_te_reopt.LS,
                                           {test_te_reopt.LS: items},
                                           as_admin=True)
@@ -438,7 +439,7 @@ class TestSharedLinks(SteerTestCase):
 class TestShortestLinks(test_te_reopt.ReoptTestCase):
 
     def test_both_spines_on_a_two_tier_clos(self):
-        cap = dict(self.srv6.capacity)
+        cap = dict(self.srv6.underlay.capacity)
         self.assertEqual(
             {('node1', 'la'), ('la', 's1'), ('la', 's2'), ('s1', 'lb'),
              ('s2', 'lb'), ('lb', 'node2')},

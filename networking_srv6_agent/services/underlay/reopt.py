@@ -109,8 +109,9 @@ def _covered(pair, paths):
 class TeReoptimiser:
     """check() is the periodic function."""
 
-    def __init__(self, plugin):
-        self._plugin = plugin
+    def __init__(self, underlay):
+        self._plugin = underlay.plugin
+        self._underlay = underlay
         self._moved = {}          # pair -> its last move
         self._link_moved = {}     # (a, b) -> time of the last move off it
         self._idle_since = {}     # auto path id -> first idle pass
@@ -131,11 +132,11 @@ class TeReoptimiser:
 
     def _congested(self, ctx, hist):
         """{(a, b): latest Mbit/s} of the links congested now."""
-        plugin, conf = self._plugin, self._plugin.conf
+        underlay, conf = self._underlay, self._underlay.conf
         out = {}
-        for link, series in plugin._load_series(ctx, hist).items():
+        for link, series in underlay.load_series(ctx, hist).items():
             last = series[-conf.te_reopt_samples:]
-            cap = plugin.capacity.get(link)
+            cap = underlay.capacity.get(link)
             since = self._link_moved.get(link)
             if (cap and len(last) == conf.te_reopt_samples and
                     all(m is not None and m > conf.te_reopt_high * cap
@@ -145,10 +146,11 @@ class TeReoptimiser:
         return out
 
     def _check(self, ctx):
-        plugin, conf = self._plugin, self._plugin.conf
-        if not plugin.capacity or not conf.te_auto_steering:
+        plugin, conf = self._plugin, self._underlay.conf
+        underlay = self._underlay
+        if not underlay.capacity or not conf.te_auto_steering:
             return
-        silent, outage = plugin._silent_fabric(ctx)
+        silent, outage = plugin.silent_fabric(ctx)
         if outage:
             LOG.error("SRv6 TE: no fabric node has posted link state for "
                       "%ss: treated as an outage of the collection, not of "
@@ -158,8 +160,8 @@ class TeReoptimiser:
         # the link-state history once per pass, for every caller below: it
         # was read 3 times idle and once more per candidate move, most of
         # the pass's CPU
-        hist = plugin._history(ctx)
-        view = plugin._link_state_view(ctx, hist)
+        hist = underlay.history(ctx)
+        view = underlay.link_state_view(ctx, hist)
         congested = self._congested(ctx, hist)
         now = timeutils.utcnow()
         hold = now - datetime.timedelta(seconds=conf.te_reopt_hold_down)
@@ -169,26 +171,26 @@ class TeReoptimiser:
         seen = now - datetime.timedelta(seconds=conf.link_state_window)
         self._pending = {k: v for k, v in self._pending.items()
                          if v[0] > seen}
-        dead = plugin._dead_links(ctx, silent, view)
-        measured = plugin._measured_load(ctx, view)
-        pairs = _pairs(plugin._aggregate_view(ctx))
+        dead = underlay.dead_links(ctx, silent, view)
+        measured = underlay.measured_load(ctx, view)
+        pairs = _pairs(underlay.aggregate_view(ctx))
         moves = self._release(ctx, pairs, congested, dead, measured, now,
                               hold)
         if not congested:
             return
-        cap = {link: mbps for link, mbps in plugin.capacity.items()
+        cap = {link: mbps for link, mbps in underlay.capacity.items()
                if link not in dead and link not in congested}
         paths = te_db.get_all_te_paths(ctx)
         moved = {}      # pair -> the pair, moved earlier in this pass
         for link in sorted(congested, key=lambda k: (
-                -congested[k] / plugin.capacity[k], k)):    # hottest first
+                -congested[k] / underlay.capacity[k], k)):    # hottest first
             if moves >= conf.te_reopt_max_moves:
                 break
             # a pair moved off an earlier link has left this one too: two
             # elephants sharing two links were both moved, one per link
             load = congested[link] - sum(pr['links'].get(link, 0.0)
                                          for pr in moved.values())
-            limit = conf.te_reopt_low * plugin.capacity[link]
+            limit = conf.te_reopt_low * underlay.capacity[link]
             if load <= limit:
                 continue
             steered, load = self._steer_pairs(
@@ -206,7 +208,7 @@ class TeReoptimiser:
     def _used(self, measured, own, key=None):
         """{link: Mbit/s held}: the measured load, own traffic off.
 
-        measured: the pass's _measured_load. own: {link: Mbit/s} of the
+        measured: the pass's measured_load. own: {link: Mbit/s} of the
         pair being placed, as the fabric measured it. Plus what the
         other pairs placed in
         the last link_state_window add to their new links (_pending): the
@@ -227,7 +229,8 @@ class TeReoptimiser:
 
         moved: {pair key: pair} of this pass, updated with every move.
         """
-        plugin, conf = self._plugin, self._plugin.conf
+        plugin, conf = self._plugin, self._underlay.conf
+        underlay = self._underlay
         on_link = [pr for pr in pairs.values() if link in pr['links']]
         if len(on_link) <= 1:
             if on_link:
@@ -235,7 +238,7 @@ class TeReoptimiser:
                          "only; moving it would move the congestion",
                          {'l': '%s>%s' % link})
             return 0, load
-        floor = conf.te_auto_min_share * plugin.capacity[link]
+        floor = conf.te_auto_min_share * underlay.capacity[link]
         autos = {(p[te_def.SOURCE_PORT_ID], p[te_def.DESTINATION_PORT_ID]): p
                  for p in paths if p.get(te_def.ORIGIN) == te_def.ORIGIN_AUTO}
         host_of = {pr['entry']['source_port_id']: pr['entry']['source_host']
@@ -262,7 +265,7 @@ class TeReoptimiser:
                                e['destination_host'], pr['rate'])
             if path is None or not all(
                     used.get(hop, 0) + pr['rate'] <=
-                    conf.te_auto_fit * plugin.capacity[hop]
+                    conf.te_auto_fit * underlay.capacity[hop]
                     for hop in pce.links_of(path)):
                 LOG.info("SRv6 TE re-optimisation: no path with room for VM "
                          "pair %(s)s>%(d)s (%(r).1f Mbit/s) off %(l)s; it "
@@ -270,7 +273,7 @@ class TeReoptimiser:
                                    'd': e['destination_port_id'],
                                    'r': pr['rate'], 'l': '%s>%s' % link})
                 continue
-            placed = plugin._place_auto_path(ctx, e, path, existing)
+            placed = plugin.place_auto_path(ctx, e, path, existing)
             if placed is None:
                 continue
             autos[key] = placed
@@ -297,7 +300,7 @@ class TeReoptimiser:
 
     def _room_for_another(self, e, autos, host_of):
         """The caps: auto paths in all, steered VMs per node."""
-        conf = self._plugin.conf
+        conf = self._underlay.conf
         if len(autos) >= conf.te_auto_max_paths:
             LOG.info("SRv6 TE re-optimisation: te_auto_max_paths (%d) "
                      "reached; not steering %s", conf.te_auto_max_paths,
@@ -316,12 +319,13 @@ class TeReoptimiser:
 
     def _release(self, ctx, pairs, congested, dead, measured, now, hold):
         """Release the auto paths no longer needed. Returns releases."""
-        plugin, conf = self._plugin, self._plugin.conf
+        plugin, conf = self._plugin, self._underlay.conf
+        underlay = self._underlay
         autos = te_db.get_all_te_paths(ctx, {'origin': [te_def.ORIGIN_AUTO]})
         alive = {p['id'] for p in autos}
         self._idle_since = {k: t for k, t in self._idle_since.items()
                             if k in alive}
-        live = {link: mbps for link, mbps in plugin.capacity.items()
+        live = {link: mbps for link, mbps in underlay.capacity.items()
                 if link not in dead}
         released = 0
         for p in autos:
@@ -331,17 +335,15 @@ class TeReoptimiser:
             pr = pairs.get(key)
             rate = pr['rate'] if pr else 0.0
             src = pr['entry']['source_host'] if pr else \
-                plugin._destination_of(ctx, {te_def.DESTINATION_PORT_ID:
-                                             key[0]})
+                plugin.host_of_port(ctx, key[0])
             dst = pr['entry']['destination_host'] if pr else \
-                plugin._destination_of(ctx, {te_def.DESTINATION_PORT_ID:
-                                             key[1]})
+                plugin.host_of_port(ctx, key[1])
             hops = pce.links_of([src] + p[te_def.VIA_HOSTS] + [dst])
             # the links the topology knows: a VM that is gone or unbound
             # leaves an end of the path unknown, which must not make the
             # floor 0 and the path never idle
-            known = [plugin.capacity[hop] for hop in hops
-                     if hop in plugin.capacity]
+            known = [underlay.capacity[hop] for hop in hops
+                     if hop in underlay.capacity]
             floor = conf.te_auto_min_share * min(known) if known else 0.0
             why = None
             if not rate or rate < floor:
@@ -356,12 +358,12 @@ class TeReoptimiser:
                 own = pr['links'] if pr else {}
                 if default and not (default & set(congested)) and all(
                         max(0, measured.get(hop, 0) - own.get(hop, 0)) +
-                        rate <= conf.te_reopt_low * plugin.capacity[hop]
+                        rate <= conf.te_reopt_low * underlay.capacity[hop]
                         for hop in default):
                     why = 'the default routes have room again'
             if why is None or self._moved.get(key, hold) > hold:
                 continue
-            if plugin._release_auto_path(ctx, p) is None:
+            if plugin.release_auto_path(ctx, p) is None:
                 continue
             released += 1
             self._moved[key] = now       # no re-steering inside the hold-down
