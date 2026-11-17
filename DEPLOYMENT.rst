@@ -276,7 +276,7 @@ hypervisor, as your user:
   re-applied at every boot;
 - hot-plugs one NIC per link into each node and, over SSH, sets the link
   address and a route to every locator through its leaf (re-applied at
-  every boot);
+  every boot), then restarts the node's OVS agent so it uses them at once;
 - installs the topology file on node1 as ``[srv6] topology_file`` and
   restarts the Neutron server. The switches' agents use the admin
   credentials from node1's ``~/devstack/openrc``.
@@ -290,16 +290,9 @@ Run it::
         --image ~/srv6-lab/noble-server-cloudimg-amd64.img \
         --ssh-key ~/.ssh/id_ed25519.pub
 
-It takes a few minutes: each switch boots once to configure itself, powers
-off, and the script starts it for good. Running it again only adds what is
-missing.
-
-The agents pick up the new underlay at their next full resync (every 5
-minutes); restart them to do it now::
-
-    for i in 1 2 3; do
-        ssh stack@192.168.122.10$i sudo systemctl restart devstack@q-agt
-    done
+It takes a minute or two: each switch boots once to configure itself,
+powers off, and the script starts it for good. Running it again only adds
+what is missing.
 
 
 Check it
@@ -374,7 +367,7 @@ the server moves pairs off congested links on its own: those paths show
 and automatic steering* in `README.rst <README.rst>`__.
 
 **On a switch** (``virsh domifaddr leaf1``, then ``ssh stack@<address>``):
-``ip -6 route``, ``journalctl -u srv6-fabric-agent``.
+``ip -6 route``, ``sudo journalctl -u srv6-fabric-agent``.
 
 
 Tear it down
@@ -394,6 +387,7 @@ Then the nodes::
         virsh destroy node$i; virsh undefine node$i --remove-all-storage
         virsh net-update default delete ip-dhcp-host \
             "<host mac='52:54:00:00:00:1$i'/>" --live --config
+        ssh-keygen -R 192.168.122.10$i     # a rebuilt node has a new key
     done
     virsh vol-delete --pool default noble-base.qcow2
 

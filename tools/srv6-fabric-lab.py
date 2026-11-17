@@ -264,15 +264,19 @@ CREDENTIALS = ('source ~/devstack/openrc admin admin >/dev/null 2>&1; '
 
 # Restart the Neutron server, whatever units this devstack runs it in.
 # Kill first: a graceful stop can hang for minutes.
-RESTART = r"""u=$(systemctl list-units --plain --no-legend 'devstack@q-svc*' \
-    'devstack@neutron-api*' 'devstack@neutron-rpc-server*' \
-    'devstack@neutron-periodic-workers*' | awk '{print $1}')
-[ -n "$u" ] || { echo 'no neutron server unit' >&2; exit 1; }
-sudo systemctl kill -s KILL $u || true
+# Kill, then stop: a start before the unit is down is a no-op.
+HARD_RESTART = r"""sudo systemctl kill -s KILL $u || true
 sudo systemctl stop $u || true
 sudo systemctl reset-failed $u 2>/dev/null || true
 sudo systemctl start $u
 """
+RESTART = r"""u=$(systemctl list-units --plain --no-legend 'devstack@q-svc*' \
+    'devstack@neutron-api*' 'devstack@neutron-rpc-server*' \
+    'devstack@neutron-periodic-workers*' | awk '{print $1}')
+[ -n "$u" ] || { echo 'no neutron server unit' >&2; exit 1; }
+""" + HARD_RESTART
+# the node's OVS agent: it finds the new underlay now, not at its next resync
+AGENT_RESTART = 'u=devstack@q-agt\n' + HARD_RESTART
 
 TOPO_PATH = '/etc/neutron/srv6-topology'
 UNSET = r"""f=/etc/neutron/neutron.conf
@@ -306,9 +310,10 @@ def up(nodes, links, hosts, args):
             'http://%s/networking' % ctl, openrc)
     for h, addr in hosts.items():
         remote(addr, 'cat > /tmp/srv6-fabric.sh && '
-               'sudo sh /tmp/srv6-fabric.sh install && rm /tmp/srv6-fabric.sh',
+               'sudo sh /tmp/srv6-fabric.sh install && rm /tmp/srv6-fabric.sh'
+               ' || exit 1\n' + AGENT_RESTART,
                node_script(h, nodes, links, hosts))
-        print('%s: addresses and routes set' % h)
+        print('%s: addresses and routes set, OVS agent restarted' % h)
     remote(ctl, SET, open(args.topology).read())
     print('%s: topology_file set, Neutron server restarted' % args.controller)
 
