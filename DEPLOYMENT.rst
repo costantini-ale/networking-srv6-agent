@@ -13,29 +13,38 @@ the plugin works and how to use it: `README.rst <README.rst>`__.
 Requirements
 ------------
 
-=======================  =================================  ==================
-Requirement              Why                                Check
-=======================  =================================  ==================
-ML2/OVS with VXLAN       The node side extends the OVS      ``openstack
-                         agent. OVN and linuxbridge are     network agent
-                         not supported.                     list``
-Kernel with SRv6         ``seg6`` / ``seg6local`` routes;   ``grep SEG6
-                         stock on Ubuntu and Debian.        /boot/config-*``
-``vrf`` kernel module    One Linux VRF per domain. Ubuntu   ``modinfo vrf``
-                         cloud images need
+=======================  =====================================================
+Requirement              Why
+=======================  =====================================================
+ML2/OVS with VXLAN       The node side extends the OVS agent. OVN and
+                         linuxbridge are not supported.
+Kernel with SRv6         ``seg6`` / ``seg6local`` routes; stock on Ubuntu and
+                         Debian.
+``vrf`` kernel module    One Linux VRF per domain. Ubuntu cloud images need
                          ``linux-modules-extra``.
-Kernel + iproute2 6.1+   Only for ``usid`` (the default):   ``uname -r``,
-                         microSID routes. ``encap`` works   ``ip -V``
-                         on older ones.
-IPv6 underlay            Carries the SRv6 packets between   ``ping -6`` every
-                         nodes. The plugin uses it, never   other node
-                         configures it.
-Underlay MTU             The outer header adds 40 to 64+    see `MTU`_
-                         bytes to every VM packet.
-Python 3.11+             --                                 ``python3 -V``
-Neutron                  Same release as the rest of the    --
-                         cloud (the DevStack branch).
-=======================  =================================  ==================
+Kernel + iproute2 6.1+   Only for ``usid`` (the default): microSID routes.
+                         ``encap`` works on older ones.
+IPv6 underlay            Carries the SRv6 packets between nodes. The plugin
+                         uses it, never configures it.
+Underlay MTU             The outer header adds 40 to 64+ bytes to every VM
+                         packet (see `MTU`_).
+Python 3.11+             --
+Neutron                  Same release as the rest of the cloud (the DevStack
+                         branch).
+=======================  =====================================================
+
+Verify, on every node before stacking::
+
+    grep SEG6_LWTUNNEL /boot/config-$(uname -r)  # CONFIG_IPV6_SEG6_LWTUNNEL=y
+    modinfo vrf                                  # module info, no error
+    uname -r                                     # 6.1 or newer (usid)
+    ip -V                                        # iproute2 6.1 or newer (usid)
+    python3 -V                                   # 3.11 or newer
+    ping -6 -c1 <other node underlay address>    # a reply, from every peer
+
+and after stacking, on the controller::
+
+    openstack network agent list --agent-type open-vswitch  # all nodes, alive
 
 VXLAN still carries the traffic between VMs of the *same* network; SRv6
 carries only the traffic between networks of a domain. The agent loads
@@ -68,25 +77,21 @@ The agent finds the underlay NIC from the route to the peers' locators; set
 MTU
 ~~~
 
-Rule: **underlay MTU >= network MTU + extra bytes**.
+SRv6 wraps each VM packet in an outer IPv6 header, so it must fit:
+**underlay MTU >= network MTU + 40** (``usid``; +16 per waypoint beyond
+four), or **+ 64** (``encap``; +16 per waypoint).
 
-=============  ==============  ==========================================
-Encoding       Direct route    Each TE waypoint adds
-=============  ==============  ==========================================
-``usid``       40 bytes        nothing for the first four, then 16 bytes
-``encap``      64 bytes        16 bytes
-=============  ==============  ==========================================
+With DevStack defaults (VXLAN networks, 1500-byte underlay, ``usid``, at
+most four waypoints) there is nothing to do: 1450 + 40 = 1490. It breaks
+with:
 
-::
+- ``encap``: 1450 + 64 = 1514.
+- VLAN or flat networks in a domain: 1500 + 40 = 1540.
+- Five or more waypoints with ``usid`` (fabric switches count).
+- A network MTU raised by hand.
 
-    openstack network show <net> -c mtu    # network MTU (what VMs send)
-    ip link show <nic>                     # underlay MTU
-
-Example: a 1500-byte underlay gives VXLAN networks MTU 1450, leaving 50
-bytes: enough for ``usid`` (40), not for ``encap`` (64).
-
-Symptom when it does not fit: ping works, large transfers stall. The agent
-logs a warning with the largest network MTU that fits. Fix one side::
+Symptom: ping works, large transfers stall; the agent logs a warning with
+the largest network MTU that fits. Fix one side::
 
     sudo ip link set <nic> mtu 9000              # raise the underlay MTU
     openstack network set --mtu 1400 <net>       # or lower the network MTU
