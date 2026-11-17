@@ -34,9 +34,14 @@ Resource                 Meaning
 SRv6 domain              A set of networks of one project, routed to each
                          other over SRv6. Gets a function id
                          (``0xe000``-``0xefff``) from which its SIDs and its
-                         routing table on every node derive.
+                         routing table on every node derive. Domains are
+                         isolated from each other, even with overlapping
+                         addresses.
 Network association      Joins a network to a domain, like a router interface
-                         joins a network to a router.
+                         joins a network to a router. The network must
+                         belong to the domain's project, not be external,
+                         have no router interface, be in no other domain,
+                         and have no subnet overlapping the domain's.
 Locator                  A node's /48 prefix (e.g. ``fc00:0:2::/48``), set in
                          the agent config. A domain's SID on a node is the
                          locator plus the domain's function id.
@@ -98,115 +103,16 @@ How a change reaches the nodes:
 5. Every agent also calls ``sync_state`` at start-up and every
    ``resync_interval`` (300 s) to repair lost or reordered messages.
 
-What the agent installs
-~~~~~~~~~~~~~~~~~~~~~~~
+Example
+-------
 
-For domain ``red`` (function id ``0xe005``, table 57349) on node 2 (locator
-``fc00:0:2::/48``), with ``vm-a2`` on ``net-a`` and a remote ``vm-b3``
-(``10.50.2.13``) on node 3, the agent installs the equivalent of::
+Two networks of one project, joined by domain ``red``, with a VM on each,
+on two different compute nodes: ``node1`` (locator ``fc00:0:1::/48``) and
+``node2`` (locator ``fc00:0:2::/48``). A third node, ``node3``
+(``fc00:0:3::/48``), is used later as a waypoint.
 
-    # VRF, sealed by an unreachable default
-    ip link add sv6vrf-57349 type vrf table 57349
-    ip -4 route add unreachable default metric 4278198272 table 57349
-    ip -6 route add unreachable default metric 4278198272 table 57349
-    # decapsulation SID: locator + function id
-    ip -6 route add fc00:0:2:e005::/64 encap seg6local \
-        action End.DT46 vrftable 57349 dev sv6vrf-57349
-    # gateway port of net-a (local VLAN 1) inside the VRF
-    ovs-vsctl add-port br-int svp-57349-1 tag=1 \
-        -- set interface svp-57349-1 type=internal
-    ip link set svp-57349-1 master sv6vrf-57349
-    ip addr add 10.50.1.1/24 dev svp-57349-1
-    # route to a remote VM, and the rule that sends it to the underlay
-    ip route add 10.50.2.13/32 encap seg6 mode encap.red \
-        segs fc00:0:3:e005:: dev eth1 table 57349
-    ip -6 rule add pref 999 iif sv6vrf-57349 \
-        to fc00:0:3:e005::/128 lookup main
-
-- **VRF** (``sv6vrf-<function id>``): the domain's routing table. The
-  *seal* ends lookups that find nothing, so traffic never leaks into the
-  host table.
-- **Decapsulation SID** (``End.DT46``): strips the outer header of arriving
-  packets and looks them up in the VRF.
-- **Gateway port** (``svp-<function id>-<vlan>``): an OVS internal port
-  holding the subnet gateway address. Every node hosting the network has
-  its own.
-- **Route per remote VM**: encapsulates toward the decapsulation SID on that
-  VM's node. Per VM, not per subnet, so a TE path can steer one VM.
-- **Rule 999**: sends the encapsulated packet to the main table, where the
-  underlay route forwards it.
-
-Waypoints and isolation
-~~~~~~~~~~~~~~~~~~~~~~~
-
-- **Waypoints.** Every node installs a uN SID (``End`` with ``next-csid``) on
-  its locator, so any node or fabric switch can be a waypoint. A TE path
-  only changes the route's destination, e.g. ``fc00:0:1:3:e005::`` goes
-  through node 1 to node 3. Up to four waypoints fit in the 40-byte header;
-  a longer path adds an SRH.
-- **Isolation.** The VRF separates domains, even with overlapping addresses.
-  The seal blocks unknown destinations, the ``local`` rule is moved after
-  the VRF rules so VMs cannot reach host addresses, and an nftables table
-  drops packets from a gateway port that are addressed to a node SID or
-  carry an SRH (RFC 8754 edge filtering).
-
-
-Repository layout
------------------
-
-``networking_srv6_agent/`` -- the Neutron plugin (Python package)
-  - ``services/``: the service plugin. ``plugin.py`` is the entry point
-    (API calls, SID allocation, validation); ``rpc.py`` talks to the agents;
-    ``te_resolver.py`` decides which path each TE path really takes;
-    ``te_liveness.py`` re-pushes paths when a waypoint dies or comes back;
-    ``pce.py`` is the path computation (CSPF); ``workload.py`` finds the VM
-    ports and their hosts.
-  - ``services/underlay/``: the optional automatic steering. It stores the
-    link load and heavy VM pairs sent by the telemetry agents and moves
-    pairs off congested links.
-  - ``agent/``: the agent extension. ``agent_extension.py`` reacts to port and
-    domain events; ``dataplane.py`` turns them into kernel state.
-  - ``privileged/``: the few operations that need root (``ip`` route and
-    link commands, ``modprobe vrf``, ``nft`` rulesets), run through privsep.
-  - ``api/definitions/`` and ``extensions/``: the REST resources (domains,
-    associations, locators, TE paths, link state, aggregates).
-  - ``db/``: database models and queries; ``db/migration/`` holds the
-    Alembic migrations.
-  - ``policies/``: who may call each API (oslo.policy rules).
-  - ``cli/``: the ``openstack srv6 ...`` commands (OpenStackClient plugin).
-  - ``common/``: configuration options and SID arithmetic.
-  - ``tests/unit/``: unit tests (``stestr``).
-
-``srv6_dashboard/`` -- the Horizon panels
-  ``dashboards/project/`` (SRv6 domains, network topology with domains),
-  ``dashboards/admin/`` (SRv6 overview, underlay topology), ``api/`` (calls to
-  the Neutron API), ``enabled/`` (the files that register the panels in
-  Horizon), ``test/`` (dashboard tests).
-
-``devstack/`` -- the DevStack plugin
-  ``plugin.sh`` installs and configures everything on a node; ``settings``
-  holds the ``SRV6_*`` variables and their defaults.
-
-``tools/``
-  ``srv6-fabric-agent.py``, the optional telemetry agent for underlay switches
-  (link load and heavy VM pairs).
-
-
-Deploying
----------
-
-The plugin needs ML2/OVS with VXLAN, a Linux kernel with SRv6 and VRF
-support (6.1 or newer for ``usid``), and an IPv6 underlay that routes every
-node's locator. ``DEPLOYMENT.rst`` explains each requirement, lists the
-DevStack settings and walks through a three-node example, plus the optional
-fabric for link state and automatic steering.
-
-
-Using it
---------
-
-Connect networks
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Create the networks and the domain
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
@@ -218,38 +124,109 @@ Connect networks
     openstack srv6 domain create red
     openstack srv6 network association create red net-a
     openstack srv6 network association create red net-b
+    openstack srv6 domain show red          # function id, e.g. 0xe005
 
-    # one VM per network, pinned to two different compute nodes (admin)
+    # one VM per network, pinned to two nodes (needs admin)
     openstack server create --image cirros --flavor m1.tiny \
-        --network net-a --availability-zone nova:node1 vm-a
+        --network net-a --availability-zone nova:node1 vm-a   # 10.0.1.10
     openstack server create --image cirros --flavor m1.tiny \
-        --network net-b --availability-zone nova:node2 vm-b
+        --network net-b --availability-zone nova:node2 vm-b   # 10.0.2.20
 
-``--availability-zone nova:<host>`` places a VM on a given compute node
-(``openstack compute service list`` shows the host names); without it the
-scheduler picks the node. The VMs reach each other through their subnet
-gateway, which now lives on every node that hosts one of them. Removing
-an association or deleting the domain removes the state from every node.
+``--availability-zone nova:<host>`` chooses the compute node (``openstack
+compute service list`` shows the names); without it the scheduler picks one.
+The VMs need no configuration: they keep using their subnet's gateway.
 
-Rules an association must follow (the API refuses otherwise):
+2. What appears on the nodes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- the network belongs to the domain's project and is not external;
-- the network has **no router interface** (and a router interface cannot be
-  added later): a network is routed either by a Neutron router or by a domain;
-- a network belongs to at most one domain;
-- subnets in one domain must not overlap.
+Only nodes that host a VM of ``red`` get its state. On ``node1``, the agent
+installs the equivalent of (the table number is the function id,
+``0xe005`` = 57349)::
 
-A domain routes traffic *between* its networks only. Traffic between two VMs
-of the same network stays on L2 (VXLAN) and never uses SRv6.
+    # the domain's VRF; the unreachable default ends lookups that find
+    # nothing, so traffic never leaks into the host's tables
+    ip link add sv6vrf-57349 type vrf table 57349
+    ip -4 route add unreachable default metric 4278198272 table 57349
+    ip -6 route add unreachable default metric 4278198272 table 57349
 
-Inspect::
+    # red's SID on node1 (locator + function id): strip the outer header
+    # and look the inner packet up in the VRF
+    ip -6 route add fc00:0:1:e005::/64 encap seg6local \
+        action End.DT46 vrftable 57349 dev sv6vrf-57349
+
+    # net-a's gateway, an OVS port inside the VRF (every node hosting
+    # net-a has its own 10.0.1.1)
+    ovs-vsctl add-port br-int svp-57349-1 tag=1 \
+        -- set interface svp-57349-1 type=internal
+    ip link set svp-57349-1 master sv6vrf-57349
+    ip addr add 10.0.1.1/24 dev svp-57349-1
+
+    # vm-b: encapsulate toward red's SID on node2, and send the
+    # encapsulated packet to the underlay (rule 999)
+    ip route add 10.0.2.20/32 encap seg6 mode encap.red \
+        segs fc00:0:2:e005:: dev eth0 table 57349
+    ip -6 rule add pref 999 iif sv6vrf-57349 \
+        to fc00:0:2:e005::/128 lookup main
+
+``node2`` gets the mirror image: SID ``fc00:0:2:e005::``, net-b's gateway
+``10.0.2.1``, and a route to ``vm-a`` toward ``fc00:0:1:e005::``. To see it:
+``ip -br link show type vrf``, ``ip -6 route show table all | grep seg6``,
+``ip route show table 57349``.
+
+3. A packet from vm-a to vm-b
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``vm-a`` sends to its gateway ``10.0.1.1``. The VRF on ``node1`` matches the
+route to ``10.0.2.20`` and wraps the packet in an IPv6 header addressed to
+``fc00:0:2:e005::`` (40 bytes, no SRH). The underlay delivers it to
+``node2``, where ``End.DT46`` strips the header and puts the packet into
+``red``'s VRF, whose connected route for ``net-b`` hands it to ``vm-b``. No
+router namespace, network node or L3 agent is involved.
+
+4. Steer it through a waypoint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+    openstack srv6 te path create --domain red --destination-host node2 \
+        --via-host node3
+    openstack srv6 te path list --domain red --long     # status ACTIVE
+
+On ``node1`` only the route to ``vm-b`` (and its rule) change: the
+destination becomes ``fc00:0:3:2:e005::``, which lists ``node3``, then
+``node2``, then the function. ``node3`` shifts its own entry out and
+forwards the packet to ``fc00:0:2:e005::``. Up to four waypoints fit in the
+same 40-byte header; a longer path adds an SRH. If ``node3`` goes down, the
+path turns ``DEGRADED`` and the traffic falls back to the direct route.
+
+5. Clean up
+~~~~~~~~~~~
+
+::
+
+    openstack srv6 te path delete <id>
+    openstack server delete vm-a vm-b
+    openstack srv6 domain delete red
+
+Deleting the domain (or an association) removes its state from every node.
+
+
+CLI and dashboard
+-----------------
+
+``openstack command list --group openstack.srv6.v2`` lists every CLI
+command. Domains and associations::
 
     openstack srv6 domain list --long
-    openstack srv6 domain show red        # function id, SIDs
+    openstack srv6 domain show red
     openstack srv6 network association list red
+    openstack srv6 network association delete red net-a
 
-Traffic engineering (admin)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A domain routes traffic *between* its networks only: traffic between two
+VMs of the same network stays on L2 (VXLAN) and never uses SRv6.
+
+TE paths (admin)
+~~~~~~~~~~~~~~~~
 
 ::
 
@@ -312,7 +289,56 @@ Horizon
 - *Admin → Network → SRv6*: all domains, locators, TE paths.
 - *Admin → Network → SRv6 Topology*: the underlay graph with live link load.
 
-``openstack command list --group openstack.srv6.v2`` lists every CLI command.
+
+Repository layout
+-----------------
+
+``networking_srv6_agent/`` -- the Neutron plugin (Python package)
+  - ``services/``: the service plugin. ``plugin.py`` is the entry point
+    (API calls, SID allocation, validation); ``rpc.py`` talks to the agents;
+    ``te_resolver.py`` decides which path each TE path really takes;
+    ``te_liveness.py`` re-pushes paths when a waypoint dies or comes back;
+    ``pce.py`` is the path computation (CSPF); ``workload.py`` finds the VM
+    ports and their hosts.
+  - ``services/underlay/``: the optional automatic steering. It stores the
+    link load and heavy VM pairs sent by the telemetry agents and moves
+    pairs off congested links.
+  - ``agent/``: the agent extension. ``agent_extension.py`` reacts to port and
+    domain events; ``dataplane.py`` turns them into kernel state.
+  - ``privileged/``: the few operations that need root (``ip`` route and
+    link commands, ``modprobe vrf``, ``nft`` rulesets), run through privsep.
+  - ``api/definitions/`` and ``extensions/``: the REST resources (domains,
+    associations, locators, TE paths, link state, aggregates).
+  - ``db/``: database models and queries; ``db/migration/`` holds the
+    Alembic migrations.
+  - ``policies/``: who may call each API (oslo.policy rules).
+  - ``cli/``: the ``openstack srv6 ...`` commands (OpenStackClient plugin).
+  - ``common/``: configuration options and SID arithmetic.
+  - ``tests/unit/``: unit tests (``stestr``).
+
+``srv6_dashboard/`` -- the Horizon panels
+  ``dashboards/project/`` (SRv6 domains, network topology with domains),
+  ``dashboards/admin/`` (SRv6 overview, underlay topology), ``api/`` (calls to
+  the Neutron API), ``enabled/`` (the files that register the panels in
+  Horizon), ``test/`` (dashboard tests).
+
+``devstack/`` -- the DevStack plugin
+  ``plugin.sh`` installs and configures everything on a node; ``settings``
+  holds the ``SRV6_*`` variables and their defaults.
+
+``tools/``
+  ``srv6-fabric-agent.py``, the optional telemetry agent for underlay switches
+  (link load and heavy VM pairs).
+
+
+Deploying
+---------
+
+The plugin needs ML2/OVS with VXLAN, a Linux kernel with SRv6 and VRF
+support (6.1 or newer for ``usid``), and an IPv6 underlay that routes every
+node's locator. ``DEPLOYMENT.rst`` explains each requirement, lists the
+DevStack settings and walks through a three-node example, plus the optional
+fabric for link state and automatic steering.
 
 
 Configuration reference
