@@ -110,7 +110,7 @@ Get the plugin (for the fabric script and topology file), the Ubuntu 24.04
 cloud image, and an SSH key::
 
     mkdir -p ~/srv6-lab && cd ~/srv6-lab        # all later steps run here
-    git clone https://github.com/costantini-ale/networking-srv6-agent.git
+    git clone https://github.com/system-fab/networking-srv6-agent.git
     wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
     [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
 
@@ -218,7 +218,7 @@ Write ``~/devstack/local.conf``. On **node1** (controller and compute)::
     enable_service q-svc q-agt q-dhcp q-l3 q-meta n-cpu
     disable_service ovn-controller ovn-northd q-ovn-metadata-agent
 
-    enable_plugin networking-srv6-agent https://github.com/costantini-ale/networking-srv6-agent.git main
+    enable_plugin networking-srv6-agent https://github.com/system-fab/networking-srv6-agent.git main
     SRV6_LOCATOR=fc00:0:1::/48
 
 On **node2** (compute). On **node3** the same, with
@@ -244,7 +244,7 @@ On **node2** (compute). On **node3** the same, with
     disable_all_services
     enable_service n-cpu q-agt placement-client
 
-    enable_plugin networking-srv6-agent https://github.com/costantini-ale/networking-srv6-agent.git main
+    enable_plugin networking-srv6-agent https://github.com/system-fab/networking-srv6-agent.git main
     SRV6_LOCATOR=fc00:0:2::/48
 
 The locators must match ``tools/fabric.topo``. Stack **node1 first**, then
