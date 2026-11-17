@@ -12,23 +12,18 @@ SRv6 connectivity and traffic engineering for OpenStack Neutron (ML2/OVS).
 What it does
 ------------
 
-Neutron routes the traffic between a project's networks with a router, in
-one of three modes: *legacy* (a router namespace on a network node), *DVR*
-(a copy of the router on every compute node) or *OVN* (logical flows in Open
-vSwitch). All three carry packets between nodes in VXLAN or Geneve tunnels,
-and none supports Segment Routing over IPv6 (SRv6).
-
-This plugin adds SRv6 as a fourth routing mode for the traffic between a
-project's networks. It builds no new data plane: the Linux kernel of every
-node already implements SRv6, and the plugin connects it to the Open vSwitch
-agent that already wires the VMs, so traffic leaving a tenant network is
-routed by the kernel and carried over the IPv6 underlay in SRv6. Routing is
-distributed: the node of the sender encapsulates every packet straight
-toward the destination node, with no network node in the path. Because the
-sender writes the path into the packet, the plugin can also steer traffic
-through chosen waypoints, which no other mode allows. It is a standalone
-package: Neutron is not modified, VMs need no configuration and keep using
-their subnet's gateway, and networks outside a domain behave as before.
+The plugin adds a new Neutron routing mode for the traffic between a
+project's networks, based on Segment Routing over IPv6 (SRv6). It builds no new
+data plane: the Linux kernel of every node already implements SRv6, and the
+plugin connects it to the Open vSwitch agent that already wires the VMs, so
+traffic leaving a tenant network is routed by the kernel and carried over
+the IPv6 underlay in SRv6. Routing is distributed: the node of the sender
+encapsulates every packet straight toward the destination node, with no
+network node in the path. Because the sender writes the path into the
+packet, the plugin can also steer traffic through chosen waypoints. It is a
+standalone package: Neutron is not modified, VMs need no configuration and
+keep using their subnet's gateway, and networks outside a domain behave as
+before.
 
 - **Domains.** Networks grouped into an SRv6 domain reach each other, as if
   attached to one router. Domains are isolated from each other, even with
@@ -69,12 +64,13 @@ header and look the inner packet up in a given routing table).
 Resources
 ~~~~~~~~~
 
-The plugin adds four resources to the Neutron API::
+The plugin adds four resources to the Neutron API:
 
-    Neutron network 1 --- 0..1 network association * --- 1 SRv6 domain
-                                                              | 1
-                                                              | *
-    compute node 1 --- 0..1 locator * --- waypoints --- * TE path
+.. image:: doc/images/resources.png
+   :alt: Resources added to the Neutron API: a network has at most one
+         network association, which belongs to one SRv6 domain; a domain
+         has TE paths, whose waypoints are locators, one per compute node.
+   :width: 460
 
 **SRv6 domain** -- takes the place of a Neutron router: a set of networks of
 one project between which traffic is routed over SRv6. At creation the
@@ -105,29 +101,14 @@ Architecture
 ~~~~~~~~~~~~
 
 Every component attaches to an existing Neutron extension point. The server
-takes every routing decision; each compute node applies it::
+takes every routing decision; each compute node applies it:
 
-         CLI, Horizon             fabric switches (telemetry agent)
-               | REST                       | REST
-    +----------v----------------------------v----------------------------+
-    | controller: neutron-server                                         |
-    |              SRv6 API extensions and policies                      |
-    |                          |                                         |
-    |   ML2, L3 --callbacks--> Srv6Plugin --+-- TE re-optimiser          |
-    |                          |            +-- liveness monitor         |
-    |                      Neutron DB                                    |
-    +-----------------------------------+---------------^----------------+
-                          fanout casts  |               | sync_state
-    ====================================v== message bus =|================
-                   |                                     |
-    +--------------v---------------+      +--------------v---------------+
-    | compute node                 |      | compute node                 |
-    |  neutron-openvswitch-agent   |      |  neutron-openvswitch-agent   |
-    |  + SRv6 extension -> br-int  |      |  + SRv6 extension -> br-int  |
-    |          | privsep           |      |          | privsep           |
-    |  kernel: VRFs, SRv6 routes,  |      |  kernel: VRFs, SRv6 routes,  |
-    |  rules, nftables             |      |  rules, nftables             |
-    +------------------------------+      +------------------------------+
+.. image:: doc/images/architecture.png
+   :alt: Components of the plugin: on the controller, neutron-server with
+         the SRv6 API extensions, Srv6Plugin, the TE re-optimiser and the
+         liveness monitor; a message bus; on each compute node, the OVS
+         agent with the SRv6 extension programming the kernel via privsep.
+   :width: 520
 
 **Server.** Five API extensions add the domains with their associations, the
 locators, the TE paths, and two read-only collections of fabric
