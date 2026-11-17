@@ -42,20 +42,52 @@ and an admin can steer that traffic along chosen paths.
 How it is built
 ~~~~~~~~~~~~~~~
 
-==============================  ==============================================
-Component                       Role
-==============================  ==============================================
-Service plugin ``srv6``         API, database, SID allocation, TE path
-                                computation; tells the agents what to install
-                                (RPC). Programs no kernel state itself.
-L2 agent extension ``srv6``     Runs inside ``neutron-openvswitch-agent`` on
-                                every node; installs VRFs, SIDs, routes and
-                                the edge filter with
-                                ``ip``/``ovs-vsctl``/``nft``.
-``srv6_dashboard``              Horizon panels.
-``tools/srv6-fabric-agent.py``  Optional telemetry agent for underlay
-                                switches (link load and heavy VM pairs).
-==============================  ==============================================
+The plugin has two halves. On the controller, the ``srv6`` **service
+plugin** inside ``neutron-server`` owns the API and the database, allocates
+SIDs, resolves TE paths and tells the agents what to install; it programs no
+kernel state itself. On every node, the ``srv6`` **agent extension** inside
+``neutron-openvswitch-agent`` installs the VRFs, SIDs, routes and edge filter
+in the Linux kernel.
+
+Repository layout:
+
+``networking_srv6_agent/`` -- the Neutron plugin (Python package)
+  - ``services/``: the service plugin. ``plugin.py`` is the entry point
+    (API calls, SID allocation, validation); ``rpc.py`` talks to the agents;
+    ``te_resolver.py`` decides which path each TE path really takes;
+    ``te_liveness.py`` re-pushes paths when a waypoint dies or comes back;
+    ``pce.py`` is the path computation (CSPF); ``workload.py`` finds the VM
+    ports and their hosts.
+  - ``services/underlay/``: the optional automatic steering. It stores the
+    link load and heavy VM pairs sent by the telemetry agents and moves
+    pairs off congested links.
+  - ``agent/``: the agent extension. ``agent_extension.py`` reacts to port and
+    domain events; ``dataplane.py`` turns them into kernel state.
+  - ``privileged/``: the few operations that need root (``ip`` route and
+    link commands, ``modprobe vrf``, ``nft`` rulesets), run through privsep.
+  - ``api/definitions/`` and ``extensions/``: the REST resources (domains,
+    associations, locators, TE paths, link state, aggregates).
+  - ``db/``: database models and queries; ``db/migration/`` holds the
+    Alembic migrations.
+  - ``policies/``: who may call each API (oslo.policy rules).
+  - ``cli/``: the ``openstack srv6 ...`` commands (OpenStackClient plugin).
+  - ``common/``: configuration options and SID arithmetic.
+  - ``tests/unit/``: unit tests (``stestr``).
+
+``srv6_dashboard/`` -- the Horizon panels
+  ``dashboards/project/`` (SRv6 domains, network topology with domains),
+  ``dashboards/admin/`` (SRv6 overview, underlay topology), ``api/`` (calls to
+  the Neutron API), ``enabled/`` (the files that register the panels in
+  Horizon), ``test/`` (dashboard tests).
+
+``devstack/`` -- the DevStack plugin
+  ``plugin.sh`` installs and configures everything on a node; ``settings``
+  holds the ``SRV6_*`` variables and their defaults.
+
+``tools/``
+  ``srv6-fabric-agent.py``, the optional telemetry agent for underlay switches
+  (link load and heavy VM pairs); ``django-manage.py``, used to run the
+  dashboard tests.
 
 Each node announces its **locator** (an IPv6 prefix, e.g. ``fc00:0:1::/48``);
 a domain's SID on that node is the locator plus the domain's function id.
