@@ -1,0 +1,32 @@
+# Example underlay topology: two spines, two leaves, three hosts.
+#
+# Read by the plugin ([srv6] topology_file) and by srv6-fabric-lab.py.
+# Hosts use their Neutron host name; every locator is a /48 in the same
+# /32. Links are numbered in file order (link i = fd01:<i>::/64): append
+# new ones at the end.
+#
+#        spine1      spine2
+#          |  \     /  |
+#          |    \ /    |
+#          |    / \    |
+#        leaf1       leaf2
+#        /   \          \
+#     node1  node2     node3
+
+# node <name> <locator>
+node spine1 fc00:0:101::/48
+node spine2 fc00:0:102::/48
+node leaf1  fc00:0:103::/48
+node leaf2  fc00:0:104::/48
+node node1  fc00:0:1::/48
+node node2  fc00:0:2::/48
+node node3  fc00:0:3::/48
+
+# link <a> <b> <capacity, Mbit/s per direction>
+link spine1 leaf1 1000
+link spine1 leaf2 1000
+link spine2 leaf1 1000
+link spine2 leaf2 1000
+link leaf1 node1 1000
+link leaf1 node2 1000
+link leaf2 node3 1000

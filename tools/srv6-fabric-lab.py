@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """srv6-fabric-lab: build an SRv6 spine-leaf test fabric of libvirt VMs.
 
-Reads the plugin's topology file ([srv6] topology_file). Every node not in
---hosts becomes a switch VM: plain Ubuntu, static routes, its own SID and,
-with --neutron-url, the telemetry agent. Every link becomes an isolated
-libvirt network with one NIC at each end. The hosts (the DevStack nodes)
-must be libvirt domains on this machine, named as in the file: they get
-their NICs here, and `config` prints the script that addresses them.
+`up` reads the plugin's topology file ([srv6] topology_file) and builds
+everything it describes:
+  - every link: an isolated libvirt network (MTU 9000);
+  - every node not in --hosts: a switch VM (Ubuntu cloud image) with its
+    link addresses, static ECMP routes, its own SID and the telemetry agent;
+  - every host (a DevStack node, a running libvirt domain here): one NIC per
+    link, then over SSH its addresses and routes (run again at boot);
+  - the controller: the topology file as [srv6] topology_file, the Neutron
+    server restarted; the agents' credentials come from its devstack openrc.
+`down` undoes all of it. Running `up` again only adds what is missing.
 
-  up      TOPO --hosts H,... --image IMG [--ssh-key F]
-          [--neutron-url URL --credentials OPENRC]
-  down    TOPO --hosts H,...
+  up      TOPO --hosts H[=ADDR],... --controller H --image IMG [--ssh-key F]
+  down    TOPO --hosts H[=ADDR],... --controller H
   config  TOPO --hosts H,... NODE   print the node's srv6-fabric.sh
   test                              self-check
 
-Run `up` and `down` as root. Addressing: link i (file order, from 1) is
-fd01:<i>::/64, first end ::1, second ::2. The NIC is named after the peer
-and has MAC 52:54:00:f0:<i>:<end>. Routes: static, ECMP over every
-shortest-path next hop to every other locator.
+Run it as a user in the libvirt group (or with sudo: SSH then goes out as
+the sudo user). Hosts are reached as stack@ADDR (ADDR defaults to the
+name). Addressing: link i (file order, from 1) is fd01:<i>::/64, first end
+::1, second ::2. The NIC is named after the peer and has MAC
+52:54:00:f0:<i>:<end>.
 """
 import argparse
 import ipaddress
@@ -28,8 +32,9 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-IMAGES = '/var/lib/libvirt/images'
-BASE = os.path.join(IMAGES, 'srv6-fabric-base.qcow2')
+# disks live in libvirt's "default" storage pool: no root needed
+POOL = 'default'
+BASE = 'srv6-fabric-base.qcow2'
 VIRSH = ['virsh', '-q', '-c', 'qemu:///system']
 
 
@@ -124,7 +129,10 @@ NIC = r"""for f in /proc/sys/net/ipv6/conf/*/seg6_enabled; do
     echo 1 > "$f"
 done
 nic() {  # <mac> <name> <address>: name the NIC with that MAC, address it
-    cur=$(ip -br link | awk -v m="$1" '$3 == m {print $1; exit}')
+    for i in 1 2 3 4 5 6 7 8 9 10; do   # a hot-plugged NIC takes a moment
+        cur=$(ip -br link | awk -v m="$1" '$3 == m {print $1; exit}')
+        [ -n "$cur" ] && break || sleep 1
+    done
     [ -n "$cur" ] || { echo "no NIC with MAC $1 (to $2)" >&2; exit 1; }
     if [ "$cur" != "$2" ]; then
         ip link set "$cur" down; ip link set "$cur" name "$2"
@@ -181,30 +189,28 @@ WantedBy=multi-user.target
 '''
 
 
-def user_data(node, nodes, links, hosts, args):
+def user_data(node, nodes, links, hosts, ssh_key, neutron_url, openrc):
     """cloud-init user data, as JSON: valid YAML, nothing to escape."""
-    files = [{'path': '/usr/local/sbin/srv6-fabric.sh', 'permissions': '0755',
-              'content': node_script(node, nodes, links, hosts)}]
-    run = [['sh', '/usr/local/sbin/srv6-fabric.sh', 'install']]
-    if args.neutron_url:
-        peers = [ends(lk, node)[1] for lk in links if node in lk[1:]]
-        # <interface> <this node> <neighbour>; the NIC is named after the peer
-        link_map = ''.join('%s %s %s\n' % (p, node, p) for p in peers)
-        files += [
-            {'path': '/usr/local/sbin/srv6-fabric-agent.py',
-             'permissions': '0755',
-             'content': open(os.path.join(HERE,
-                                          'srv6-fabric-agent.py')).read()},
-            {'path': '/etc/srv6-fabric-agent.links', 'content': link_map},
-            {'path': '/etc/srv6-fabric-agent.openrc', 'permissions': '0600',
-             'content': open(args.credentials).read()},
-            {'path': '/etc/systemd/system/srv6-fabric-agent.service',
-             'content': AGENT_UNIT % args.neutron_url}]
-        run.append(['systemctl', 'enable', '--now', 'srv6-fabric-agent'])
+    peers = [ends(lk, node)[1] for lk in links if node in lk[1:]]
+    # <interface> <this node> <neighbour>; the NIC is named after the peer
+    link_map = ''.join('%s %s %s\n' % (p, node, p) for p in peers)
+    files = [
+        {'path': '/usr/local/sbin/srv6-fabric.sh', 'permissions': '0755',
+         'content': node_script(node, nodes, links, hosts)},
+        {'path': '/usr/local/sbin/srv6-fabric-agent.py',
+         'permissions': '0755',
+         'content': open(os.path.join(HERE, 'srv6-fabric-agent.py')).read()},
+        {'path': '/etc/srv6-fabric-agent.links', 'content': link_map},
+        {'path': '/etc/srv6-fabric-agent.openrc', 'permissions': '0600',
+         'content': openrc},
+        {'path': '/etc/systemd/system/srv6-fabric-agent.service',
+         'content': AGENT_UNIT % neutron_url}]
+    run = [['sh', '/usr/local/sbin/srv6-fabric.sh', 'install'],
+           ['systemctl', 'enable', '--now', 'srv6-fabric-agent']]
     user = {'name': 'stack', 'shell': '/bin/bash', 'lock_passwd': True,
             'sudo': 'ALL=(ALL) NOPASSWD:ALL'}
-    if args.ssh_key:
-        user['ssh_authorized_keys'] = [open(args.ssh_key).read().strip()]
+    if ssh_key:
+        user['ssh_authorized_keys'] = [open(ssh_key).read().strip()]
     return '#cloud-config\n' + json.dumps({
         'hostname': node, 'users': [user], 'ssh_pwauth': False,
         'write_files': files, 'runcmd': run}, indent=1)
@@ -222,8 +228,9 @@ def virsh(*cmd, check=True):
 
 
 def exists(kind, name):
-    """kind: 'dom' or 'net-'."""
-    return subprocess.run(VIRSH + [kind + 'info', name],
+    """kind: 'dom', 'net-' or 'vol-' (in POOL)."""
+    pool = ['--pool', POOL] if kind == 'vol-' else []
+    return subprocess.run(VIRSH + [kind + 'info', *pool, name],
                           capture_output=True).returncode == 0
 
 
@@ -231,18 +238,78 @@ def running(dom):
     return virsh('domstate', dom).strip() == 'running'
 
 
+# SSH as the user who ran sudo: root has no keys for the hosts
+AS_USER = (['sudo', '-u', os.environ['SUDO_USER']]
+           if os.environ.get('SUDO_USER') and os.geteuid() == 0 else [])
+
+
+def remote(addr, cmd, stdin=None):
+    r = subprocess.run(AS_USER + ['ssh', '-o', 'BatchMode=yes', '-o',
+                                  'ConnectTimeout=10', 'stack@' + addr, cmd],
+                       input=stdin, capture_output=True, text=True)
+    if r.returncode:
+        sys.exit('stack@%s: %s\n%s'
+                 % (addr, cmd.splitlines()[0], r.stderr.strip()))
+    return r.stdout
+
+
+# The agents' Keystone identity: devstack's admin (link state is admin-only)
+CREDENTIALS = ('source ~/devstack/openrc admin admin >/dev/null 2>&1; '
+               "env | grep -E '^OS_(AUTH_URL|USERNAME|PASSWORD|PROJECT_NAME|"
+               "USER_DOMAIN_ID|PROJECT_DOMAIN_ID)='")
+
+# Restart the Neutron server, whatever units this devstack runs it in.
+# Kill first: a graceful stop can hang for minutes.
+RESTART = r"""u=$(systemctl list-units --plain --no-legend 'devstack@q-svc*' \
+    'devstack@neutron-api*' 'devstack@neutron-rpc-server*' \
+    'devstack@neutron-periodic-workers*' | awk '{print $1}')
+[ -n "$u" ] || { echo 'no neutron server unit' >&2; exit 1; }
+sudo systemctl kill -s KILL $u || true
+sudo systemctl stop $u || true
+sudo systemctl reset-failed $u 2>/dev/null || true
+sudo systemctl start $u
+"""
+
+TOPO_PATH = '/etc/neutron/srv6-topology'
+UNSET = r"""f=/etc/neutron/neutron.conf
+sudo sed -i '/^\[srv6\]/,/^\[/{/^topology_file *=/d}' $f
+"""
+SET = r"""set -e
+sudo install -m 644 /dev/stdin %s
+""" % TOPO_PATH + UNSET + r"""grep -q '^\[srv6\]' $f ||
+    printf '\n[srv6]\n' | sudo tee -a $f >/dev/null
+sudo sed -i 's|^\[srv6\]$|[srv6]\ntopology_file = %s|' $f
+""" % TOPO_PATH + RESTART
+
+HOST_UNSET = ('sudo systemctl disable -q srv6-fabric 2>/dev/null; '
+              'sudo rm -f /etc/systemd/system/srv6-fabric.service '
+              '/usr/local/sbin/srv6-fabric.sh '
+              '/etc/systemd/networkd.conf.d/10-srv6-fabric.conf; '
+              'sudo systemctl daemon-reload')
+
+
 def up(nodes, links, hosts, args):
     for h in hosts:
-        if not exists('dom', h):
-            sys.exit('host %s is not a libvirt domain here' % h)
+        if not exists('dom', h) or not running(h):
+            sys.exit('host %s is not a running libvirt domain here' % h)
+    ctl = hosts[args.controller]
+    openrc = remote(ctl, CREDENTIALS)
+    if 'OS_PASSWORD=' not in openrc:
+        sys.exit('no admin credentials in %s:~/devstack/openrc' % ctl)
     # the user data holds the credentials: gone when done
     with tempfile.TemporaryDirectory() as tmp:
-        _up(nodes, links, hosts, args, tmp)
-    print('next, on every host: %s config <topology> --hosts %s <host>'
-          % (sys.argv[0], ','.join(hosts)))
+        _up(nodes, links, hosts, args, tmp,
+            'http://%s/networking' % ctl, openrc)
+    for h, addr in hosts.items():
+        remote(addr, 'cat > /tmp/srv6-fabric.sh && '
+               'sudo sh /tmp/srv6-fabric.sh install && rm /tmp/srv6-fabric.sh',
+               node_script(h, nodes, links, hosts))
+        print('%s: addresses and routes set' % h)
+    remote(ctl, SET, open(args.topology).read())
+    print('%s: topology_file set, Neutron server restarted' % args.controller)
 
 
-def _up(nodes, links, hosts, args, tmp):
+def _up(nodes, links, hosts, args, tmp, neutron_url, openrc):
     for lk in links:
         net = netname(lk)
         if not exists('net-', net):
@@ -255,25 +322,25 @@ def _up(nodes, links, hosts, args, tmp):
         virsh('net-autostart', net)
     print('links: %d networks' % len(links))
 
-    if not os.path.exists(BASE):
-        sh('cp', args.image, BASE)
+    if not exists('vol-', BASE):
+        virsh('vol-create-as', POOL, BASE, str(os.path.getsize(args.image)),
+              '--format', 'qcow2')
+        virsh('vol-upload', '--pool', POOL, BASE, args.image)
     switches = [n for n in nodes if n not in hosts]
     for k, n in enumerate(switches, 1):
         if exists('dom', n):
             print('%s: exists, left alone' % n)
             continue
-        disk = os.path.join(IMAGES, 'srv6-fabric-%s.qcow2' % n)
-        seed = os.path.join(IMAGES, 'srv6-fabric-%s-seed.iso' % n)
+        disk = 'srv6-fabric-%s.qcow2' % n
         mgmt_mac = '52:54:00:f0:00:%02x' % k
         ud, nc = os.path.join(tmp, 'ud'), os.path.join(tmp, 'nc')
-        open(ud, 'w').write(user_data(n, nodes, links, hosts, args))
+        open(ud, 'w').write(user_data(n, nodes, links, hosts, args.ssh_key,
+                                      neutron_url, openrc))
         open(nc, 'w').write(json.dumps({'version': 2, 'ethernets': {'mgmt': {
             'match': {'macaddress': mgmt_mac}, 'set-name': 'mgmt',
             'dhcp4': True}}}))
-        sh('qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2',
-           '-b', BASE, disk, '8G')
-        sh('cloud-localds', '--network-config=' + nc, seed, ud)
-        os.chmod(seed, 0o600)                       # it holds the credentials
+        virsh('vol-create-as', POOL, disk, '8G', '--format', 'qcow2',
+              '--backing-vol', BASE, '--backing-vol-format', 'qcow2')
         nics = ['--network', 'network=default,model=virtio,mac=' + mgmt_mac]
         for lk in links:
             if n in lk[1:]:
@@ -282,28 +349,31 @@ def _up(nodes, links, hosts, args, tmp):
         sh('virt-install', '-q', '--connect', 'qemu:///system', '--import',
            '--name', n, '--memory', str(args.memory), '--vcpus', '1',
            '--osinfo', 'detect=on,name=ubuntu24.04',
-           '--disk', 'path=%s,bus=virtio' % disk,
-           '--disk', 'path=%s,device=cdrom' % seed,
+           '--disk', 'vol=%s/%s,bus=virtio' % (POOL, disk),
+           '--cloud-init', 'user-data=%s,network-config=%s' % (ud, nc),
            *nics, '--graphics', 'none', '--noautoconsole')
         print('%s: created' % n)
 
     for h in hosts:
         have = virsh('domiflist', h).lower()
-        live = ['--live'] if running(h) else []
         for lk in links:
             if h in lk[1:] and ends(lk, h)[3] not in have:
                 virsh('attach-interface', '--domain', h, '--type', 'network',
                       '--source', netname(lk), '--model', 'virtio',
-                      '--mac', ends(lk, h)[3], '--config', *live)
+                      '--mac', ends(lk, h)[3], '--config', '--live')
                 print('%s: NIC toward %s' % (h, ends(lk, h)[1]))
 
 
-def down(nodes, links, hosts):
+def down(nodes, links, hosts, controller):
+    remote(hosts[controller], UNSET + 'sudo rm -f %s\n' % TOPO_PATH + RESTART)
+    print('%s: topology_file removed, Neutron server restarted' % controller)
     for n in nodes:
         if n in hosts:
             if not exists('dom', n):
                 continue
             live = ['--live'] if running(n) else []
+            if live:
+                remote(hosts[n], HOST_UNSET)
             have = virsh('domiflist', n).lower()
             for lk in links:
                 if n in lk[1:] and ends(lk, n)[3] in have:
@@ -313,43 +383,23 @@ def down(nodes, links, hosts):
         elif exists('dom', n):
             virsh('destroy', n, check=False)
             virsh('undefine', n)
-            for f in ('srv6-fabric-%s.qcow2', 'srv6-fabric-%s-seed.iso'):
-                if os.path.exists(os.path.join(IMAGES, f % n)):
-                    os.remove(os.path.join(IMAGES, f % n))
+            virsh('vol-delete', '--pool', POOL, 'srv6-fabric-%s.qcow2' % n,
+                  check=False)
             print('%s: deleted' % n)
     for lk in links:
         if exists('net-', netname(lk)):
             virsh('net-destroy', netname(lk), check=False)
             virsh('net-undefine', netname(lk))
-    print('links removed; the hosts keep their routes until rebooted '
-          'without srv6-fabric.service')
+    print('fabric removed; on each host, restore its underlay routes')
 
 
 # --- self-check -------------------------------------------------------------
 
-SAMPLE = '''node spine1 fc00:0:101::/48
-node spine2 fc00:0:102::/48
-node leaf1  fc00:0:103::/48
-node leaf2  fc00:0:104::/48
-node node1  fc00:0:1::/48
-node node2  fc00:0:2::/48
-node node3  fc00:0:3::/48
-link spine1 leaf1 1000
-link spine1 leaf2 1000
-link spine2 leaf1 1000
-link spine2 leaf2 1000
-link leaf1 node1 1000
-link leaf1 node2 1000
-link leaf2 node3 1000
-'''
-
-
 def selftest():
-    with tempfile.NamedTemporaryFile('w', suffix='.topo') as f:
-        f.write(SAMPLE)
-        f.flush()
-        nodes, links = load(f.name)
-    hosts = ['node1', 'node2', 'node3']
+    nodes, links = load(os.path.join(HERE, 'fabric.topo'))
+    hosts = parse_hosts('node1=10.0.0.11,node2,node3')
+    assert hosts == {'node1': '10.0.0.11', 'node2': 'node2',
+                     'node3': 'node3'}, hosts
     r = dict(routes('leaf1', nodes, links))
     assert r['fc00:0:3::/48'] == [('fd01:1::1', 'spine1'),
                                   ('fd01:3::1', 'spine2')], r
@@ -367,13 +417,9 @@ def selftest():
     assert 'seg6local' not in s and 'forwarding' not in s
     assert 'nic 52:54:00:f0:05:02 leaf1 fd01:5::2' in s, s
 
-    with tempfile.NamedTemporaryFile('w') as cred:
-        cred.write('OS_AUTH_URL=x\n')
-        cred.flush()
-        args = argparse.Namespace(neutron_url='http://ctl/networking',
-                                  ssh_key=None, credentials=cred.name)
-        ud = json.loads(user_data('leaf1', nodes, links, hosts, args)
-                        .split('\n', 1)[1])
+    ud = json.loads(user_data('leaf1', nodes, links, hosts, None,
+                              'http://ctl/networking', 'OS_AUTH_URL=x\n')
+                    .split('\n', 1)[1])
     link_map = [w['content'] for w in ud['write_files']
                 if w['path'] == '/etc/srv6-fabric-agent.links'][0]
     assert link_map.splitlines() == [
@@ -382,41 +428,45 @@ def selftest():
     print('srv6-fabric-lab self-test ok')
 
 
+def parse_hosts(text):
+    """'node1=10.0.0.11,node2' -> {'node1': '10.0.0.11', 'node2': 'node2'}"""
+    return dict((h.split('=', 1) + [h])[:2] for h in text.split(',') if h)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('action', choices=['up', 'down', 'config', 'test'])
     p.add_argument('topology', nargs='?')
     p.add_argument('node', nargs='?', help='config: the node')
     p.add_argument('--hosts', default='',
-                   help='comma-separated: the DevStack nodes (no switch VM)')
+                   help='the DevStack nodes, NAME[=SSH address],...')
+    p.add_argument('--controller', help='up/down: the host running Neutron')
     p.add_argument('--image', help='up: Ubuntu 24.04 cloud image')
     p.add_argument('--ssh-key', help='up: public key for user stack')
     p.add_argument('--memory', type=int, default=1024,
                    help='up: MB of RAM per switch (default 1024)')
-    p.add_argument('--neutron-url', help='up: install the telemetry agent')
-    p.add_argument('--credentials', help='up: openrc file for the agent')
     a = p.parse_intermixed_args()
     if a.action == 'test':
         return selftest()
     if not a.topology or not a.hosts:
         p.error('needs a topology file and --hosts')
     nodes, links = load(a.topology)
-    hosts = a.hosts.split(',')
+    hosts = parse_hosts(a.hosts)
     for h in hosts:
         if h not in nodes:
             p.error('host %s is not in the topology' % h)
     if a.action == 'config':
         if a.node not in nodes:
             p.error('config needs a node of the topology')
-        sys.stdout.write(node_script(a.node, nodes, links, hosts))
-    elif a.action == 'up':
-        if not a.image and not os.path.exists(BASE):
+        return sys.stdout.write(node_script(a.node, nodes, links, hosts))
+    if a.controller not in hosts:
+        p.error('--controller must be one of --hosts')
+    if a.action == 'up':
+        if not a.image and not exists('vol-', BASE):
             p.error('up needs --image')
-        if bool(a.neutron_url) != bool(a.credentials):
-            p.error('--neutron-url and --credentials go together')
         up(nodes, links, hosts, a)
     else:
-        down(nodes, links, hosts)
+        down(nodes, links, hosts, a.controller)
 
 
 if __name__ == '__main__':
