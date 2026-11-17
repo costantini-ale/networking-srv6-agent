@@ -15,9 +15,7 @@ What it does
 The plugin adds a new Neutron routing mode for the traffic between a
 project's networks, based on Segment Routing over IPv6 (SRv6). It bridges
 the Linux kernel, which already implements SRv6, with the Open vSwitch agent
-of every node. It is a standalone package: Neutron is not modified, VMs need
-no configuration and keep using their subnet's gateway, and networks outside
-a domain behave as before.
+of every node. It is a standalone package: Neutron is not modified.
 
 Concepts
 ~~~~~~~~
@@ -271,7 +269,8 @@ It needs a topology file on the controller (without it, link state is
 disabled and fabric nodes cannot be waypoints) and the telemetry agent on
 every fabric switch (without it there is nothing to measure, so the server
 never steers anything). How to set both up: *Optional: a fabric for
-link state and automatic steering* in ``DEPLOYMENT.rst``. Watch it::
+link state and automatic steering* in
+`DEPLOYMENT.rst <DEPLOYMENT.rst>`__. Watch it::
 
     openstack srv6 link list --long        # load per link, stale flag
     openstack srv6 aggregate list --long   # heavy VM pairs per link
@@ -283,12 +282,51 @@ Thresholds and limits are the ``te_reopt_*`` and ``te_auto_*`` options in
 Horizon
 ~~~~~~~
 
-- *Project → Network → SRv6 Domains*: create domains, associate networks.
-- *Project → Network → Network Topology*: replaced by a version that shows
-  domains.
-- *Admin → Network → SRv6*: all domains, locators, TE paths.
-- *Admin → Network → SRv6 Topology*: the underlay graph with live link load.
+The ``srv6_dashboard`` package adds these panels under *Network*:
 
+==========================  =======  ==========================================
+Panel                       Who      What it does
+==========================  =======  ==========================================
+Project → SRv6 Domains      project  Create, edit and delete domains; attach
+                                     and detach networks. CLI: ``srv6
+                                     domain``, ``srv6 network association``.
+Project → Network Topology  project  Horizon's topology view, with each domain
+                                     drawn as a link between its networks.
+Admin → SRv6                admin    Three tabs: all domains, TE paths
+                                     (create, edit waypoints, delete) and
+                                     node locators. CLI: ``srv6 te path``,
+                                     ``srv6 locator``.
+Admin → SRv6 Topology       admin    The underlay graph with the live load of
+                                     every link (needs the topology file).
+                                     CLI: ``srv6 link list``.
+==========================  =======  ==========================================
+
+The screenshots below show the example above on a six-node test bed, where
+``node1``, ``node2`` and ``node3`` are ``ubuntu-ovs1``, ``ubuntu-ovs2`` and
+``ubuntu-ovs3``, with traffic flowing from ``vm-a`` to ``vm-b`` along the TE
+path.
+
+.. image:: doc/images/horizon-domain.png
+   :alt: Project, SRv6 Domains: the detail page of domain red, Network
+         Associations tab, listing net-a and net-b.
+   :width: 700
+
+.. image:: doc/images/horizon-network-topology.png
+   :alt: Project, Network Topology: net-a and net-b, each with its VM,
+         joined by a dashed line labelled SRv6 domain red.
+   :width: 700
+
+.. image:: doc/images/horizon-te-paths.png
+   :alt: Admin, SRv6, TE Paths tab: one path of domain red to host
+         ubuntu-ovs2 via ubuntu-ovs3, with its segments and pushed SID
+         fc00:0:3:2:e313::, status ACTIVE.
+   :width: 700
+
+.. image:: doc/images/horizon-underlay-topology.png
+   :alt: Admin, SRv6 Topology: the spine-leaf fabric with the six compute
+         nodes; the links of the steered path from ubuntu-ovs1 through
+         ubuntu-ovs3 to ubuntu-ovs2 are drawn red (over 72 percent load).
+   :width: 700
 
 Repository layout
 -----------------
@@ -336,34 +374,76 @@ Deploying
 
 The plugin needs ML2/OVS with VXLAN, a Linux kernel with SRv6 and VRF
 support (6.1 or newer for ``usid``), and an IPv6 underlay that routes every
-node's locator. ``DEPLOYMENT.rst`` explains each requirement, lists the
-DevStack settings and walks through a three-node example, plus the optional
-fabric for link state and automatic steering.
+node's locator. The `deployment guide <DEPLOYMENT.rst>`__ explains each
+requirement, lists the DevStack settings and walks through a three-node
+example, plus the optional fabric for link state and automatic steering.
 
 
 Configuration reference
 -----------------------
 
-Main options; see ``networking_srv6_agent/common/config.py`` for all of them.
+Only ``locator`` has no default and must be set; every other option works
+as is. The tables list the main options, ``oslo-config-generator`` lists
+all of them with their help text.
 
-``[srv6]`` in ``neutron.conf`` (server)
-  ``dataplane_encoding`` (``usid``), ``function_id_ranges``
-  (``0xe000:0xefff``), ``vrf_table_base`` (``0``), ``te_liveness_interval``
-  (``15`` s; failover time ≈ Neutron's ``agent_down_time`` + this),
-  ``topology_file``, ``te_reopt_interval`` (``10`` s, ``0`` = off),
-  ``te_auto_steering`` (``true``).
+``[srv6]`` in ``neutron.conf`` (controller)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+======================== ================= ===================================
+Option                   Default           What it does
+======================== ================= ===================================
+``dataplane_encoding``   ``usid``          ``usid`` or ``encap``, one value for
+                                           the whole deployment. Change it only
+                                           with no domains: restart the server,
+                                           then the agents.
+``function_id_ranges``   ``0xe000:0xefff`` SID function ids, shared by all
+                                           projects (4096). Do not change.
+``vrf_table_base``       ``0``             A domain's VRF table is this plus its
+                                           function id.
+``te_liveness_interval`` ``15`` s          How often to look for dead TE
+                                           waypoints. Failover time is about
+                                           Neutron's ``agent_down_time`` plus
+                                           this; ``0`` = off.
+``topology_file``        unset             Underlay topology; enables link state
+                                           (see the *Link state* section).
+``te_auto_steering``     ``true``          Let the server steer heavy VM pairs
+                                           off congested links.
+``te_reopt_interval``    ``10`` s          How often link load is checked;
+                                           ``0`` = off.
+======================== ================= ===================================
+
+The other ``te_reopt_*``, ``te_auto_*`` and ``link_state_*`` options are
+thresholds and limits, described under *Link state and automatic steering*.
 
 ``[srv6_agent]`` in the OVS agent config (every node)
-  ``locator`` (required), ``underlay_interface`` (auto), ``resync_interval``
-  (``300`` s), ``apply_sysctls`` (``true``; set ``false`` if config
-  management owns ``seg6_enabled``, ``forwarding``, ``rp_filter``…).
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``[quotas]``
-  ``quota_srv6_domain`` (``10`` per project; ``-1`` unlimited). All projects
-  share the 4096 function ids.
+The file the OVS agent reads (``ml2_conf.ini`` in DevStack)::
 
-Changing ``dataplane_encoding`` requires a deployment with no domains:
-restart the server, then the agents.
+    [srv6_agent]
+    locator = fc00:0:1::/48
+
+======================== ================= ===================================
+Option                   Default           What it does
+======================== ================= ===================================
+``locator``              required          This node's IPv6 prefix, unique per
+                                           node and routed by the underlay. The
+                                           agent does not start without it.
+``underlay_interface``   auto              Interface the encapsulated packets
+                                           leave by. Unset, it is found from
+                                           the route to the locator.
+``resync_interval``      ``300`` s         Full resync with the server.
+``apply_sysctls``        ``true``          The agent sets the kernel sysctls
+                                           SRv6 needs. Set ``false`` if config
+                                           management owns ``seg6_enabled``,
+                                           ``forwarding``, ``rp_filter``...
+======================== ================= ===================================
+
+``[quotas]`` in ``neutron.conf``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``quota_srv6_domain`` is the number of domains per project (default ``10``,
+``-1`` = unlimited). All projects share the 4096 function ids.
 
 
 Development
