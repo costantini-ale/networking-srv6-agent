@@ -29,10 +29,10 @@ every link 1 Gbit/s::
 =========  =================  ================  ===========================
 VM         Role               Management        Locator
 =========  =================  ================  ===========================
-node1      controller +       192.168.122.11    ``fc00:0:1::/48``
+node1      controller +       192.168.122.101    ``fc00:0:1::/48``
            compute
-node2      compute            192.168.122.12    ``fc00:0:2::/48``
-node3      compute            192.168.122.13    ``fc00:0:3::/48``
+node2      compute            192.168.122.102    ``fc00:0:2::/48``
+node3      compute            192.168.122.103    ``fc00:0:3::/48``
 spine1/2   SRv6 switch        DHCP              ``fc00:0:101::/48``,
                                                 ``fc00:0:102::/48``
 leaf1/2    SRv6 switch        DHCP              ``fc00:0:103::/48``,
@@ -151,9 +151,9 @@ a 60 GB copy-on-write disk on top of it)::
     for i in 1 2 3; do
         if [ $i = 1 ]; then mem=8192 cpu=4; else mem=4096 cpu=2; fi
         mac=52:54:00:00:00:1$i
-        # a fixed address: 192.168.122.1<i>
+        # a fixed address: 192.168.122.10<i>
         virsh net-update default add ip-dhcp-host \
-            "<host mac='$mac' name='node$i' ip='192.168.122.1$i'/>" \
+            "<host mac='$mac' name='node$i' ip='192.168.122.10$i'/>" \
             --live --config
         virsh vol-create-as default node$i.qcow2 60G --format qcow2 \
             --backing-vol noble-base.qcow2 --backing-vol-format qcow2
@@ -180,7 +180,7 @@ Check that you can log in (this also records the host keys, which the
 fabric script needs) and that the kernel has what the plugin needs::
 
     for i in 1 2 3; do
-        ssh -o StrictHostKeyChecking=accept-new stack@192.168.122.1$i \
+        ssh -o StrictHostKeyChecking=accept-new stack@192.168.122.10$i \
             'hostname; modinfo -F name vrf; uname -r; ip -V'
     done
     # node<i>, vrf, kernel 6.1+, iproute2 6.1+ on each
@@ -189,7 +189,7 @@ fabric script needs) and that the kernel has what the plugin needs::
 Install DevStack
 ----------------
 
-On each node, as ``stack`` (``ssh stack@192.168.122.1<i>``)::
+On each node, as ``stack`` (``ssh stack@192.168.122.10<i>``)::
 
     git clone https://opendev.org/openstack/devstack -b stable/2026.2
     cd devstack
@@ -197,7 +197,7 @@ On each node, as ``stack`` (``ssh stack@192.168.122.1<i>``)::
 Write ``~/devstack/local.conf``. On **node1** (controller and compute)::
 
     [[local|localrc]]
-    HOST_IP=192.168.122.11
+    HOST_IP=192.168.122.101
     ADMIN_PASSWORD=secret
     DATABASE_PASSWORD=$ADMIN_PASSWORD
     RABBIT_PASSWORD=$ADMIN_PASSWORD
@@ -217,11 +217,11 @@ Write ``~/devstack/local.conf``. On **node1** (controller and compute)::
     SRV6_LOCATOR=fc00:0:1::/48
 
 On **node2** (compute). On **node3** the same, with
-``HOST_IP=192.168.122.13`` and ``SRV6_LOCATOR=fc00:0:3::/48``::
+``HOST_IP=192.168.122.103`` and ``SRV6_LOCATOR=fc00:0:3::/48``::
 
     [[local|localrc]]
-    HOST_IP=192.168.122.12
-    SERVICE_HOST=192.168.122.11
+    HOST_IP=192.168.122.102
+    SERVICE_HOST=192.168.122.101
     MYSQL_HOST=$SERVICE_HOST
     RABBIT_HOST=$SERVICE_HOST
     GLANCE_HOSTPORT=$SERVICE_HOST:9292
@@ -280,7 +280,7 @@ Run it::
 
     cd ~/srv6-lab/networking-srv6-agent
     tools/srv6-fabric-lab.py up tools/fabric.topo \
-        --hosts node1=192.168.122.11,node2=192.168.122.12,node3=192.168.122.13 \
+        --hosts node1=192.168.122.101,node2=192.168.122.102,node3=192.168.122.103 \
         --controller node1 \
         --image ~/srv6-lab/noble-server-cloudimg-amd64.img \
         --ssh-key ~/.ssh/id_ed25519.pub
@@ -293,7 +293,7 @@ The agents pick up the new underlay at their next full resync (every 5
 minutes); restart them to do it now::
 
     for i in 1 2 3; do
-        ssh stack@192.168.122.1$i sudo systemctl restart devstack@q-agt
+        ssh stack@192.168.122.10$i sudo systemctl restart devstack@q-agt
     done
 
 
@@ -380,7 +380,7 @@ boot script, ``topology_file``)::
 
     cd ~/srv6-lab/networking-srv6-agent
     tools/srv6-fabric-lab.py down tools/fabric.topo \
-        --hosts node1=192.168.122.11,node2=192.168.122.12,node3=192.168.122.13 \
+        --hosts node1=192.168.122.101,node2=192.168.122.102,node3=192.168.122.103 \
         --controller node1
 
 Then the nodes::
@@ -501,3 +501,31 @@ file says and run on each the script that ``tools/srv6-fabric-lab.py config
 tools/fabric.topo --hosts ... <switch>`` prints (it finds NICs by MAC: edit
 the ``nic`` lines), plus the telemetry agent as ``user_data`` in the script
 installs it.
+
+
+Deploy on physical nodes
+------------------------
+
+The same plugin runs on bare-metal servers; only the machines and the
+underlay change. The steps above build everything as VMs; here you supply
+the servers and the IPv6 network between them.
+
+1. **Servers.** Ubuntu 24.04 (or another Linux with kernel 6.1+ and
+   iproute2 6.1+), one management IPv4 address per server reachable from
+   the others, a ``stack`` user with passwordless ``sudo``. The ``vrf``
+   module must load (``sudo modprobe vrf``); on Ubuntu it needs the
+   ``linux-modules-extra`` package of the running kernel.
+2. **Locators.** Give each server a unique ``/48`` (see `Requirements`_).
+   It is not configured on an interface; the agent installs the routes for
+   the SIDs inside it.
+3. **Underlay.** Make the network between the servers route every
+   server's locator to that server over IPv6, on the NIC that faces the
+   network. The plugin never configures it. Set the MTU as described in
+   `MTU`_.
+4. **DevStack.** Follow `Install DevStack`_ on each server, with its own
+   ``HOST_IP`` and ``SRV6_LOCATOR`` in ``local.conf``: controller first,
+   then the computes.
+5. **Check.** Run the commands at the end of `Install DevStack`_ (agents
+   alive, one locator per server), then the checks of `Check it`_. If the
+   underlay has a topology file, set ``SRV6_TOPOLOGY_FILE`` on the
+   controller to enable link state and automatic steering.
