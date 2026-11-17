@@ -333,8 +333,8 @@ Telemetry agent     every fabric switch     Nothing is measured, so the
                                             server never steers.
 ==================  ======================  ==================================
 
-Example fabric, every link 1 Gbit/s; the hosts now reach the locators
-through their leaf::
+Example fabric: two spines, two leaves, the three hosts of the example
+above, every link 1 Gbit/s::
 
          spine1      spine2
            |  \     /  |
@@ -344,33 +344,48 @@ through their leaf::
          /   \          \
       node1  node2     node3
 
-1. Switches
-~~~~~~~~~~~
+``tools/srv6-fabric-lab.py`` builds it as VMs: one small VM per switch
+(plain Ubuntu, static routes, its own SID, the telemetry agent), one
+isolated libvirt network per link, and a new NIC on each host.
 
-Any Linux router (SONiC, Linux VMs). Each switch gets a locator in the same
-/32 and its own SID; every locator must be reachable from every node (an
-IGP, or static ECMP routes). On ``leaf1`` (locator ``fc00:0:103::/48``)::
+Prerequisites
+~~~~~~~~~~~~~
 
-    sudo sysctl -w net.ipv6.conf.all.forwarding=1
-    sudo sysctl -w net.ipv6.conf.all.seg6_enabled=1   # and on every fabric NIC
+=====================  ======================================================
+What                   Details
+=====================  ======================================================
+Hypervisor             Linux with KVM and libvirt, ideally Ubuntu 24.04,
+                       with the packages below. Run the script with
+                       ``sudo``.
+The hosts as VMs       The DevStack nodes are libvirt VMs on the same
+                       hypervisor, each named like its Neutron host
+                       (``openstack compute service list``).
+Switch image           Ubuntu 24.04 cloud image, about 600 MB (kernel 6.8,
+                       iproute2 6.1: ``usid`` works).
+Resources              Per switch: 1 vCPU, 1 GB RAM (``--memory``), about
+                       2 GB of disk. The example: 4 GB RAM, 8 GB disk.
+Management network     libvirt's ``default`` NAT network, active. The
+                       switches reach the controller's Neutron through it.
+Admin credentials      An openrc-style file for the telemetry agent:
+                       ``OS_AUTH_URL``, ``OS_USERNAME``, ``OS_PASSWORD``,
+                       ``OS_PROJECT_NAME``.
+SSH key (optional)     To log in to the switches as ``stack``.
+=====================  ======================================================
 
-    # the SIDs sit on a dummy interface: it never goes down
-    sudo ip link add sr0 type dummy && sudo ip link set sr0 up
+On the hypervisor::
 
-    # usid: the switch's uN
-    sudo ip -6 route add fc00:0:103::/48 encap seg6local action End \
-        flavors next-csid lblen 32 nflen 16 dev sr0
-    # encap: the switch's End SID, <locator>:fff0::
-    sudo ip -6 route add fc00:0:103:fff0::/128 encap seg6local action End \
-        dev sr0
+    sudo apt-get install -y qemu-kvm libvirt-daemon-system virtinst \
+        cloud-image-utils
+    wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+    virsh -c qemu:///system net-list --all   # "default" active
 
-2. Topology file
+1. Topology file
 ~~~~~~~~~~~~~~~~
 
-On ``node1``, e.g. ``/opt/stack/srv6-topology``, referenced in its
-``local.conf`` with ``SRV6_TOPOLOGY_FILE=/opt/stack/srv6-topology``::
+The plugin and the script read the same file, ``fabric.topo``. Hosts use
+their Neutron host name; switches need a locator in the hosts' /32::
 
-    # node <name> <locator>     hosts use their Neutron host name
+    # node <name> <locator>
     node spine1 fc00:0:101::/48
     node spine2 fc00:0:102::/48
     node leaf1  fc00:0:103::/48
@@ -387,42 +402,49 @@ On ``node1``, e.g. ``/opt/stack/srv6-topology``, referenced in its
     link leaf1 node2 1000
     link leaf2 node3 1000
 
-3. Telemetry agent
-~~~~~~~~~~~~~~~~~~
+2. Build the fabric
+~~~~~~~~~~~~~~~~~~~
 
-Copy ``tools/srv6-fabric-agent.py`` to every switch (Python 3, no
-dependencies). It needs two files.
+On the hypervisor::
 
-A link map, ``<interface> <this node> <neighbour>`` per line, names as in
-the topology file. For ``leaf1``::
-
-    eth1 leaf1 spine1
-    eth2 leaf1 spine2
-    eth3 leaf1 node1
-    eth4 leaf1 node2
-
-Admin credentials in an openrc-style file: ``OS_AUTH_URL``,
-``OS_USERNAME``, ``OS_PASSWORD``, ``OS_PROJECT_NAME``.
-
-Run it as a service with ``CAP_NET_ADMIN``::
-
-    srv6-fabric-agent.py test                       # self-check
-    srv6-fabric-agent.py --links links.txt --period 5 --aggregates \
+    sudo tools/srv6-fabric-lab.py up fabric.topo --hosts node1,node2,node3 \
+        --image noble-server-cloudimg-amd64.img \
+        --ssh-key ~/.ssh/id_ed25519.pub \
         --neutron-url http://10.0.0.11/networking --credentials admin-openrc
 
-======================  ======================================================
-Option                  Meaning
-======================  ======================================================
-``--links``             The link map above.
-``--period``            Seconds between reports.
-``--aggregates``        Also report the heaviest VM pairs per link (needed for
-                        automatic steering).
-``--neutron-url``       Network endpoint (``openstack endpoint list --service
-                        network``).
-``--credentials``       The openrc-style file above.
-======================  ======================================================
+Every node not in ``--hosts`` becomes a switch. Link *i* (file order) is
+``fd01:<i>::/64``; each NIC is named after its peer. Routes are static ECMP
+over every shortest path. Without ``--neutron-url`` the switches still
+route but report nothing. Running ``up`` again only adds what is missing.
 
-4. Check it
+3. Configure the hosts
+~~~~~~~~~~~~~~~~~~~~~~
+
+The hosts now reach every locator through their leaf. On the hypervisor,
+for each host::
+
+    tools/srv6-fabric-lab.py config fabric.topo --hosts node1,node2,node3 \
+        node1 | ssh stack@10.0.0.11 'cat > f.sh && sudo sh f.sh install'
+
+It addresses the new NIC, replaces the ``fc00:0:N::/48`` routes of
+`1. Underlay`_ (drop them from netplan too) and runs again at every boot.
+The agent picks the new NIC by itself unless ``SRV6_UNDERLAY_INTERFACE`` is
+set. VXLAN stays on the management network.
+
+4. Point the plugin at the file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Copy ``fabric.topo`` to the controller, e.g. ``/opt/stack/fabric.topo``.
+Before stacking: ``SRV6_TOPOLOGY_FILE=/opt/stack/fabric.topo`` in its
+``local.conf``. On a running cloud::
+
+    # [srv6] in /etc/neutron/neutron.conf
+    topology_file = /opt/stack/fabric.topo
+
+    sudo systemctl restart devstack@neutron-api devstack@neutron-rpc-server \
+        devstack@neutron-periodic-workers
+
+5. Check it
 ~~~~~~~~~~~
 
 ::
@@ -431,3 +453,28 @@ Option                  Meaning
     openstack srv6 te path create --domain red --destination-host node2 \
         --via-host spine1                  # a switch as a waypoint: ACTIVE
     openstack srv6 te path list --long     # origin=auto: steered by the server
+
+On a switch (``virsh domifaddr leaf1``, then ``ssh stack@<address>``):
+``ip -6 route``, ``journalctl -u srv6-fabric-agent``.
+
+6. Remove it
+~~~~~~~~~~~~
+
+::
+
+    sudo tools/srv6-fabric-lab.py down fabric.topo --hosts node1,node2,node3
+
+It deletes the switch VMs, their disks, the link networks and the hosts'
+extra NICs. On each host, ``sudo systemctl disable srv6-fabric`` and
+restore the routes of `1. Underlay`_.
+
+Physical switches
+~~~~~~~~~~~~~~~~~
+
+Cable them as the topology file says, then run on each switch the script
+from ``tools/srv6-fabric-lab.py config fabric.topo --hosts ... <switch>``
+(it finds its NICs by MAC: edit the ``nic`` lines to your MACs). Install
+the telemetry agent as the script does for a VM (``user_data`` in it):
+``tools/srv6-fabric-agent.py``, a link map ``<interface> <this node>
+<neighbour>``, the credentials, and a systemd unit with
+``Restart=always``.

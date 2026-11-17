@@ -366,7 +366,9 @@ Repository layout
 
 ``tools/``
   ``srv6-fabric-agent.py``, the optional telemetry agent for underlay switches
-  (link load and heavy VM pairs).
+  (link load and heavy VM pairs); ``srv6-fabric-lab.py``, which builds a test
+  spine-leaf fabric of libvirt VMs from a topology file (see the deployment
+  guide).
 
 
 Deploying
