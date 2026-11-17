@@ -3,7 +3,7 @@ Deploying networking-srv6-agent (DevStack)
 ==========================================
 
 What a cloud needs to run the plugin, and a worked three-node example. How
-the plugin works and how to use it once it runs: ``README.rst``.
+the plugin works and how to use it: `README.rst <README.rst>`__.
 
 .. contents::
    :local:
@@ -13,123 +13,130 @@ the plugin works and how to use it once it runs: ``README.rst``.
 Requirements
 ------------
 
-**Neutron with ML2/OVS and VXLAN tunnels.** The node side of the plugin is
-an extension of the Open vSwitch L2 agent (``neutron-openvswitch-agent``), so
-every node that hosts VMs must run that agent. ML2/OVN has no L2 agent and
-linuxbridge has a different one: neither is supported. VXLAN still carries
-the traffic between VMs of the *same* network; SRv6 only carries the traffic
-between networks of a domain.
+=======================  =================================  ==================
+Requirement              Why                                Check
+=======================  =================================  ==================
+ML2/OVS with VXLAN       The node side extends the OVS      ``openstack
+                         agent. OVN and linuxbridge are     network agent
+                         not supported.                     list``
+Kernel with SRv6         ``seg6`` / ``seg6local`` routes;   ``grep SEG6
+                         stock on Ubuntu and Debian.        /boot/config-*``
+``vrf`` kernel module    One Linux VRF per domain. Ubuntu   ``modinfo vrf``
+                         cloud images need
+                         ``linux-modules-extra``.
+Kernel + iproute2 6.1+   Only for ``usid`` (the default):   ``uname -r``,
+                         microSID routes. ``encap`` works   ``ip -V``
+                         on older ones.
+IPv6 underlay            Carries the SRv6 packets between   ``ping -6`` every
+                         nodes. The plugin uses it, never   other node
+                         configures it.
+Underlay MTU             The outer header adds 40 to 64+    see `MTU`_
+                         bytes to every VM packet.
+Python 3.11+             --                                 ``python3 -V``
+Neutron                  Same release as the rest of the    --
+                         cloud (the DevStack branch).
+=======================  =================================  ==================
 
-**A Linux kernel with SRv6 and VRF support, on every node.** The plugin
-programs the kernel directly, with no software router in between:
+VXLAN still carries the traffic between VMs of the *same* network; SRv6
+carries only the traffic between networks of a domain. The agent loads
+``vrf`` and sets the SRv6 sysctls itself; if the kernel lacks ``usid``
+support, the server logs an error naming the node.
 
-- SRv6 routes (``seg6`` encapsulation and ``seg6local`` SIDs) need
-  ``CONFIG_IPV6_SEG6_LWTUNNEL``. Stock Ubuntu and Debian kernels have it.
-- Each domain is a Linux VRF, which needs the ``vrf`` kernel module. Ubuntu
-  cloud images ship it in a separate package, so install it once on each
-  node (the hosts, not the VMs) before stacking:
-  ``sudo apt-get install linux-modules-extra-$(uname -r)``. The agent loads
-  the module itself.
-- The ``usid`` encoding (the default) uses microSID routes that only
-  **kernel and iproute2 6.1 or newer** understand (Ubuntu 24.04 or later).
-  The agent probes this at start-up; the server logs an error naming any
-  node that lacks it. ``encap`` works on older kernels.
+Underlay
+~~~~~~~~
 
-**An IPv6 underlay between the nodes.** The *underlay* is the physical
-network that connects the OpenStack nodes; SRv6 packets travel over it as
-plain IPv6. It can be the same NIC and network that already carries
-management or VXLAN traffic. The plugin uses it but never configures it, so
-before stacking every node needs:
+The *underlay* is the physical network between the nodes (it can be the
+management or VXLAN NIC). Before stacking, every node needs:
 
-- **An IPv6 address on the underlay NIC**, any address that the other nodes
-  can reach (e.g. ``fd00::1/64``).
-- **A locator**: a unique IPv6 prefix for this node, e.g.
-  ``fc00:0:1::/48``, set with ``SRV6_LOCATOR``. It is not an interface
-  address: the node's SIDs are addresses inside it, and the agent installs
-  the routes that answer them. With ``usid`` (the default), every locator
-  must be a /48 inside the same /32 block, so the nodes differ only in the
-  third group (``fc00:0:1::/48``, ``fc00:0:2::/48``, ...).
-- **A route to every other node's locator**, via that node's underlay
-  address. When the nodes share one L2 segment, one static route per peer
-  is enough (``ip -6 route add fc00:0:2::/48 via fd00::2``, see the example
-  below). In a routed fabric, the switches must route the locators instead
-  (an IGP or static routes).
+============================  ===============================================
+What                          Example
+============================  ===============================================
+IPv6 address on the NIC       ``fd00::1/64``, reachable from the other nodes.
+Locator (``SRV6_LOCATOR``)    ``fc00:0:1::/48``, unique per node. Not an
+                              interface address: the agent installs the
+                              routes for the SIDs inside it. With ``usid``,
+                              all locators are /48s in one /32
+                              (``fc00:0:1::/48``, ``fc00:0:2::/48``, ...).
+Route to each peer locator    ``ip -6 route add fc00:0:2::/48 via fd00::2``
+                              (one per peer on a shared L2 segment; in a
+                              routed fabric the switches route them).
+============================  ===============================================
 
-The agent finds the underlay NIC from the route to each peer's locator; set
-``SRV6_UNDERLAY_INTERFACE`` only to force one. Check the underlay before
-stacking: from every node, ``ping -6`` every other node's underlay address.
+The agent finds the underlay NIC from the route to the peers' locators; set
+``SRV6_UNDERLAY_INTERFACE`` only to force one.
 
-**An underlay MTU large enough for the extra header.** To carry a VM's
-packet to another node, SRv6 puts it inside a new outer IPv6 header, so the
-packet on the underlay is bigger than the one the VM sent. The extra bytes
-are:
+MTU
+~~~
 
-=============  ===============================  ==========================
-Encoding       Direct route                     Each TE waypoint adds
-=============  ===============================  ==========================
-``usid``       40 bytes                         nothing for the first
-                                                four, then 16 bytes each
-``encap``      64 bytes                         16 bytes
-=============  ===============================  ==========================
+Rule: **underlay MTU >= network MTU + extra bytes**.
 
-The rule: **underlay MTU >= network MTU + extra bytes**. A VM sends packets up
-to its network's MTU (``openstack network show <net> -c mtu``); the underlay
-MTU is the MTU of the underlay NIC (``ip link show <nic>``). Example: on a
-1500-byte underlay, Neutron gives VXLAN networks an MTU of 1450, which leaves
-50 bytes. That fits ``usid`` (40) but not ``encap`` (64 or more).
+=============  ==============  ==========================================
+Encoding       Direct route    Each TE waypoint adds
+=============  ==============  ==========================================
+``usid``       40 bytes        nothing for the first four, then 16 bytes
+``encap``      64 bytes        16 bytes
+=============  ==============  ==========================================
 
-When it does not fit, small packets still pass but full-size ones are
-dropped, so ping works while large transfers stall. The agent logs a warning
-with the largest network MTU that would fit. Fix it either way: raise the
-underlay MTU (e.g. jumbo frames, 9000), or lower the network MTU
-(``openstack network set --mtu 1400 <net>``).
+::
 
-**Software.** Python 3.11 or newer, and Neutron from the same OpenStack
-release as the rest of the cloud (with DevStack: the branch you stack).
+    openstack network show <net> -c mtu    # network MTU (what VMs send)
+    ip link show <nic>                     # underlay MTU
+
+Example: a 1500-byte underlay gives VXLAN networks MTU 1450, leaving 50
+bytes: enough for ``usid`` (40), not for ``encap`` (64).
+
+Symptom when it does not fit: ping works, large transfers stall. The agent
+logs a warning with the largest network MTU that fits. Fix one side::
+
+    sudo ip link set <nic> mtu 9000              # raise the underlay MTU
+    openstack network set --mtu 1400 <net>       # or lower the network MTU
+
 
 DevStack settings
 -----------------
 
-Enable the plugin in ``local.conf`` on **every** node (controller and
-computes). It installs the package, enables the service plugin and the agent
-extension, writes the options into ``neutron.conf`` / ``ml2_conf.ini``, runs
-the DB migrations and, if Horizon is enabled, installs the SRv6 panels::
+In ``local.conf`` on **every** node (controller and computes)::
 
     enable_plugin networking-srv6-agent https://github.com/costantini-ale/networking-srv6-agent.git main
     SRV6_LOCATOR=fc00:0:1::/48        # unique per node
 
-Variables (defaults in ``devstack/settings``):
+The plugin installs the package, enables the service plugin and the agent
+extension, writes ``[srv6]`` / ``[srv6_agent]``, runs the DB migrations and,
+if Horizon is enabled, installs the SRv6 panels.
 
-=============================  ==========================  ================================
-Variable                       Default                     Meaning
-=============================  ==========================  ================================
-``SRV6_LOCATOR``               *(required on q-agt)*       This node's locator; unique per
-                                                           node. Stack fails without it.
-``SRV6_UNDERLAY_INTERFACE``    auto                        NIC of the IPv6 underlay. Unset:
-                                                           found from the route to each
-                                                           peer's locator.
-``SRV6_DATAPLANE_ENCODING``    ``usid``                    ``usid`` or ``encap`` (server).
-``SRV6_FUNCTION_ID_RANGES``    ``0xe000:0xefff``           Pool of domain function ids
-                                                           (server); must stay in this
-                                                           range.
-``SRV6_TOPOLOGY_FILE``         *(unset)*                   Underlay topology for link state
-                                                           and automatic steering (server).
-``SRV6_VRF_TABLE_BASE``        ``0``                       VRF table = base + function id.
-                                                           Same value on every node.
-``SRV6_RESYNC_INTERVAL``       ``300``                     Seconds between full agent
-                                                           resyncs.
-``SRV6_DASHBOARD_ENABLE``      all panels                  Horizon panel files to install.
-=============================  ==========================  ================================
+=============================  ==================  ===========================
+Variable                       Default             Meaning
+=============================  ==================  ===========================
+``SRV6_LOCATOR``               required on q-agt   This node's locator; stack
+                                                   fails without it.
+``SRV6_UNDERLAY_INTERFACE``    auto                Underlay NIC; unset = from
+                                                   the route to the peers'
+                                                   locators.
+``SRV6_DATAPLANE_ENCODING``    ``usid``            ``usid`` or ``encap``
+                                                   (server).
+``SRV6_FUNCTION_ID_RANGES``    ``0xe000:0xefff``   Domain function ids
+                                                   (server). Do not change.
+``SRV6_TOPOLOGY_FILE``         unset               Underlay topology for link
+                                                   state and automatic
+                                                   steering (server).
+``SRV6_VRF_TABLE_BASE``        ``0``               VRF table = base + function
+                                                   id. Same on every node.
+``SRV6_RESYNC_INTERVAL``       ``300``             Seconds between full agent
+                                                   resyncs.
+``SRV6_DASHBOARD_ENABLE``      all panels          Horizon panel files to
+                                                   install.
+=============================  ==================  ===========================
+
+Defaults live in ``devstack/settings``.
 
 
 Example: three nodes
 --------------------
 
-Three Ubuntu 24.04 hosts on one L2 segment. ``node1`` is the controller and
-also a compute; ``node2`` and ``node3`` are computes. The host names are the
-Neutron host names. Tested with DevStack ``stable/2026.2``, 8 GB RAM and 4
-vCPUs for ``node1``, 4 GB for the others. VMs inside VMs need nested
-virtualisation, or ``LIBVIRT_TYPE=qemu`` (slow but works).
+Three Ubuntu 24.04 hosts on one L2 segment, DevStack ``stable/2026.2``.
+``node1`` is controller + compute (8 GB RAM, 4 vCPUs), ``node2`` and
+``node3`` are computes (4 GB). Nested VMs need nested virtualisation or
+``LIBVIRT_TYPE=qemu`` (slow).
 
 =======  ===============  ===============  ==================
 Host     Management       Underlay         Locator
@@ -142,49 +149,39 @@ node3    10.0.0.13        fd00::3/64       ``fc00:0:3::/48``
 1. Underlay
 ~~~~~~~~~~~
 
-On each host, the ``vrf`` kernel module, an underlay address on the shared
-NIC (``eth0`` here; use your NIC's name, e.g. ``enp1s0``) and a route to
-every other host's locator. On ``node1``::
+On ``node1`` (``eth0`` = your NIC, e.g. ``enp1s0``)::
 
     sudo apt-get install -y linux-modules-extra-$(uname -r)   # vrf module
-    sudo ip -6 addr add fd00::1/64 dev eth0
-    sudo ip -6 route add fc00:0:2::/48 via fd00::2
-    sudo ip -6 route add fc00:0:3::/48 via fd00::3
+    sudo ip -6 addr add fd00::1/64 dev eth0                   # own address
+    sudo ip -6 route add fc00:0:2::/48 via fd00::2            # node2 locator
+    sudo ip -6 route add fc00:0:3::/48 via fd00::3            # node3 locator
 
-and the same on ``node2`` and ``node3`` with their own address and the two
-other locators. These commands do not survive a reboot. On Ubuntu, make them
-persistent with a netplan file, ``/etc/netplan/60-underlay.yaml`` (mode
-600, then ``sudo netplan apply``)::
+On ``node2`` and ``node3``: same, with their own address and the two other
+locators. Then, from every host: ``ping -6 fd00::2`` (and the others).
+
+These commands do not survive a reboot. To persist them, write
+``/etc/netplan/60-underlay.yaml`` (mode 600) and run ``sudo netplan apply``::
 
     network:
       version: 2
       ethernets:
-        eth0:
+        eth0:                     # same key as in your existing netplan file
           addresses: ["fd00::1/64"]
           routes:
             - {to: "fc00:0:2::/48", via: "fd00::2"}
             - {to: "fc00:0:3::/48", via: "fd00::3"}
 
-The key under ``ethernets`` must match the one in your existing netplan
-file (cloud images often use another id than the NIC name). Check from every
-host before stacking: ``ping -6 fd00::2`` and so on. The agent loads ``vrf``
-and sets the SRv6 sysctls (``seg6_enabled``, forwarding) itself.
-
 2. DevStack
 ~~~~~~~~~~~
 
-On each host, a ``stack`` user with passwordless sudo, and DevStack cloned
-into its home::
+On each host::
 
     sudo useradd -s /bin/bash -d /opt/stack -m stack
     sudo chmod +x /opt/stack
     echo "stack ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/stack
-    sudo -u stack -i
+    sudo -u stack -i                                  # next steps as stack
     git clone https://opendev.org/openstack/devstack -b stable/2026.2
-    cd devstack
-
-The ``local.conf`` below goes in this ``devstack`` directory, and every
-following command runs as ``stack``.
+    cd devstack                                        # local.conf goes here
 
 3. local.conf on node1 (controller)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -214,8 +211,8 @@ following command runs as ``stack``.
 4. local.conf on node2 and node3 (computes)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-On ``node2`` (``node3``: ``HOST_IP=10.0.0.13``,
-``SRV6_LOCATOR=fc00:0:3::/48``)::
+On ``node2``; on ``node3`` change ``HOST_IP=10.0.0.13`` and
+``SRV6_LOCATOR=fc00:0:3::/48``::
 
     [[local|localrc]]
     HOST_IP=10.0.0.12
@@ -243,22 +240,25 @@ On ``node2`` (``node3``: ``HOST_IP=10.0.0.13``,
 5. Stack
 ~~~~~~~~
 
-Run ``./stack.sh`` on ``node1`` first, then on ``node2`` and ``node3``. Then,
-on ``node1``, register the new computes::
+::
 
+    ./stack.sh                          # node1 first, then node2, node3
+
+    # then on node1: register the new computes
     source ~/devstack/openrc admin admin
     nova-manage cell_v2 discover_hosts
 
 6. Check it
 ~~~~~~~~~~~
 
-Everything below runs on ``node1`` as ``stack``, in a shell where
-``~/devstack/openrc admin admin`` is sourced. The control plane::
+On ``node1``, as ``stack``, with ``~/devstack/openrc admin admin`` sourced.
+
+Control plane::
 
     openstack network agent list --agent-type open-vswitch   # 3 hosts, alive
-    openstack srv6 locator list                             # one per host
+    openstack srv6 locator list                              # one per host
 
-Two networks in one domain, with a VM on each, on two different hosts::
+Two networks in one domain, one VM on each, on two hosts::
 
     openstack network create net-a
     openstack subnet create --network net-a --subnet-range 10.1.1.0/24 sub-a
@@ -268,10 +268,12 @@ Two networks in one domain, with a VM on each, on two different hosts::
     openstack srv6 network association create red net-a
     openstack srv6 network association create red net-b
 
+    # allow ping and ssh in the default security group
     sg=$(openstack security group list --project admin -f value -c ID -c Name |
          awk '$2 == "default" {print $1}')
     openstack security group rule create --protocol icmp $sg
     openstack security group rule create --protocol tcp --dst-port 22 $sg
+
     image=$(openstack image list -f value -c Name | grep -m1 cirros)
     openstack server create --image $image --flavor m1.tiny \
         --network net-a --availability-zone nova:node1 vm-a
@@ -279,41 +281,55 @@ Two networks in one domain, with a VM on each, on two different hosts::
         --network net-b --availability-zone nova:node2 vm-b
     openstack server list        # wait for ACTIVE; note both addresses
 
-A domain network has no router, so no floating IP. To reach ``vm-a``, use
-SSH from its network's DHCP namespace on ``node1`` (cirros password:
-``gocubsgo``), then ping ``vm-b``::
+Ping across the domain. A domain network has no router (so no floating IP):
+reach ``vm-a`` from its DHCP namespace (cirros password ``gocubsgo``)::
 
     sudo ip netns exec qdhcp-$(openstack network show net-a -f value -c id) \
         ssh cirros@<vm-a address>
-    $ ping <vm-b address>
+    $ ping <vm-b address>                       # inside vm-a
 
-The SRv6 state behind it, on ``node1``::
+The SRv6 state on ``node1``:
 
-    ip -br link show type vrf                     # one VRF for domain red
-    ip -6 route show table all | grep seg6local   # red's SID: decap into it
-    ip route show table all | grep 'encap seg6 '  # vm-b's route: encap to node2
+=================================================  ===========================
+Command                                            Expect
+=================================================  ===========================
+``ip -br link show type vrf``                      One VRF, for ``red``.
+``ip -6 route show table all | grep seg6local``    ``End.DT46`` on
+                                                   ``fc00:0:1:...`` (red's
+                                                   SID), plus the node's own
+                                                   ``End`` routes (one per
+                                                   node, always there).
+``ip route show table all | grep 'encap seg6 '``   ``vm-b``'s address, encap
+                                                   toward a SID in
+                                                   ``fc00:0:2::/48``
+                                                   (``mode encap.red``).
+=================================================  ===========================
 
-Expect one VRF, one ``End.DT46`` route on ``fc00:0:1:...``, and a route to
-``vm-b``'s address that is encapsulated toward a SID in ``fc00:0:2::/48``
-(``mode encap.red``). The ``seg6local`` list also shows the node's own
-``End`` routes, on the locator and on ``fc00:0:1:fff0::``: they are always
-there, one per node, not per domain.
-A TE path through ``node3`` (``openstack srv6 te path create --domain red
---destination-host node2 --via-host node3``) adds ``node3``'s SID to that
-route, and the ping still works.
+A TE path through ``node3`` adds ``node3``'s SID to that route; the ping
+still works::
+
+    openstack srv6 te path create --domain red --destination-host node2 \
+        --via-host node3
 
 
 Optional: a fabric for link state and automatic steering
 --------------------------------------------------------
 
 Everything above works without this part. It lets underlay switches be TE
-waypoints and gives the server the load of each link, so that it can move
-heavy VM pairs off congested links (see *Link state and automatic steering*
-in ``README.rst``). It needs three things: switches that forward SRv6, a
-topology file on the controller, and the telemetry agent on every switch.
+waypoints and lets the server move heavy VM pairs off congested links (see
+*Link state and automatic steering* in `README.rst <README.rst>`__).
 
-The example fabric: two spines, two leaves, and the three hosts behind the
-leaves, each link 1 Gbit/s::
+==================  ======================  ==================================
+Piece               Where                   Without it
+==================  ======================  ==================================
+SRv6 switches       every fabric switch     Switches cannot be waypoints.
+Topology file       controller              Link state is disabled.
+Telemetry agent     every fabric switch     Nothing is measured, so the
+                                            server never steers.
+==================  ======================  ==================================
+
+Example fabric, every link 1 Gbit/s; the hosts now reach the locators
+through their leaf::
 
          spine1      spine2
            |  \     /  |
@@ -323,19 +339,19 @@ leaves, each link 1 Gbit/s::
          /   \          \
       node1  node2     node3
 
-Switches
-~~~~~~~~
+1. Switches
+~~~~~~~~~~~
 
-Any Linux router works (SONiC, or Linux VMs). Each switch needs a locator in
-the same /32 block, IPv6 forwarding, and its own SID; every locator must be
-reachable from every node (an IGP, or static ECMP routes). The hosts reach
-the locators through their leaf instead of the shared segment. On ``leaf1``
-(locator ``fc00:0:103::/48``)::
+Any Linux router (SONiC, Linux VMs). Each switch gets a locator in the same
+/32 and its own SID; every locator must be reachable from every node (an
+IGP, or static ECMP routes). On ``leaf1`` (locator ``fc00:0:103::/48``)::
 
     sudo sysctl -w net.ipv6.conf.all.forwarding=1
     sudo sysctl -w net.ipv6.conf.all.seg6_enabled=1   # and on every fabric NIC
+
     # the SIDs sit on a dummy interface: it never goes down
     sudo ip link add sr0 type dummy && sudo ip link set sr0 up
+
     # usid: the switch's uN
     sudo ip -6 route add fc00:0:103::/48 encap seg6local action End \
         flavors next-csid lblen 32 nflen 16 dev sr0
@@ -343,13 +359,13 @@ the locators through their leaf instead of the shared segment. On ``leaf1``
     sudo ip -6 route add fc00:0:103:fff0::/128 encap seg6local action End \
         dev sr0
 
-Topology file
-~~~~~~~~~~~~~
+2. Topology file
+~~~~~~~~~~~~~~~~
 
-On ``node1``, with ``SRV6_TOPOLOGY_FILE=/opt/stack/srv6-topology`` in its
-``local.conf``. Hosts use their Neutron host name; capacity is Mbit/s per
-direction::
+On ``node1``, e.g. ``/opt/stack/srv6-topology``, referenced in its
+``local.conf`` with ``SRV6_TOPOLOGY_FILE=/opt/stack/srv6-topology``::
 
+    # node <name> <locator>     hosts use their Neutron host name
     node spine1 fc00:0:101::/48
     node spine2 fc00:0:102::/48
     node leaf1  fc00:0:103::/48
@@ -357,6 +373,7 @@ direction::
     node node1  fc00:0:1::/48
     node node2  fc00:0:2::/48
     node node3  fc00:0:3::/48
+    # link <a> <b> <capacity, Mbit/s per direction>
     link spine1 leaf1 1000
     link spine1 leaf2 1000
     link spine2 leaf1 1000
@@ -365,30 +382,43 @@ direction::
     link leaf1 node2 1000
     link leaf2 node3 1000
 
-Telemetry agent
-~~~~~~~~~~~~~~~
+3. Telemetry agent
+~~~~~~~~~~~~~~~~~~
 
-Copy ``tools/srv6-fabric-agent.py`` to every switch (plain Python 3, no
-dependencies) and run it as a service with ``CAP_NET_ADMIN``. It needs a
-link map, one line per neighbour (``<interface> <this node> <neighbour>``,
-names as in the topology file). For ``leaf1``::
+Copy ``tools/srv6-fabric-agent.py`` to every switch (Python 3, no
+dependencies). It needs two files.
+
+A link map, ``<interface> <this node> <neighbour>`` per line, names as in
+the topology file. For ``leaf1``::
 
     eth1 leaf1 spine1
     eth2 leaf1 spine2
     eth3 leaf1 node1
     eth4 leaf1 node2
 
-and admin credentials in an openrc-style file (``OS_AUTH_URL``,
-``OS_USERNAME``, ``OS_PASSWORD``, ``OS_PROJECT_NAME``)::
+Admin credentials in an openrc-style file: ``OS_AUTH_URL``,
+``OS_USERNAME``, ``OS_PASSWORD``, ``OS_PROJECT_NAME``.
 
+Run it as a service with ``CAP_NET_ADMIN``::
+
+    srv6-fabric-agent.py test                       # self-check
     srv6-fabric-agent.py --links links.txt --period 5 --aggregates \
         --neutron-url http://10.0.0.11/networking --credentials admin-openrc
 
-``--neutron-url`` is the network endpoint (``openstack endpoint list
---service network``); ``srv6-fabric-agent.py test`` runs a self-check.
+======================  ======================================================
+Option                  Meaning
+======================  ======================================================
+``--links``             The link map above.
+``--period``            Seconds between reports.
+``--aggregates``        Also report the heaviest VM pairs per link (needed for
+                        automatic steering).
+``--neutron-url``       Network endpoint (``openstack endpoint list --service
+                        network``).
+``--credentials``       The openrc-style file above.
+======================  ======================================================
 
-Check it
-~~~~~~~~
+4. Check it
+~~~~~~~~~~~
 
 ::
 

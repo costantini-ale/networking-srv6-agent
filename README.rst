@@ -319,7 +319,7 @@ path.
 .. image:: doc/images/horizon-te-paths.png
    :alt: Admin, SRv6, TE Paths tab: one path of domain red to host
          ubuntu-ovs2 via ubuntu-ovs3, with its segments and pushed SID
-         fc00:0:3:2:e313::, status ACTIVE.
+         fc00:0:3:2:e785::, status ACTIVE.
    :width: 700
 
 .. image:: doc/images/horizon-underlay-topology.png
@@ -444,16 +444,6 @@ Option                   Default           What it does
 
 ``quota_srv6_domain`` is the number of domains per project (default ``10``,
 ``-1`` = unlimited). All projects share the 4096 function ids.
-
-
-Development
------------
-
-::
-
-    tox -e py3         # unit tests (stestr)
-    tox -e pep8        # flake8
-    tox -e dashboard   # Horizon panel tests (installs Horizon from git)
 
 
 License
