@@ -15,16 +15,14 @@ What it does
 The plugin replaces the Neutron router for east-west traffic between a
 project's networks. You group networks into an **SRv6 domain**; traffic
 between them is routed by the Linux kernel of each compute node and carried
-across the IPv6 underlay with Segment Routing over IPv6 (SRv6), with no
-network node in the path.
+across the IPv6 underlay with Segment Routing over IPv6 (SRv6).
 
 - **Domains.** A domain is a routing context, like a VRF. Every node that
   hosts a port of the domain gets a Linux VRF, a local gateway for each
   attached network, and one SID that decapsulates traffic into that VRF
   (``End.DT46``). Domains are isolated from each other.
 - **Distributed routing.** Each node routes the packets of its own VMs and
-  encapsulates them directly toward the destination node's SID: one hop, no
-  hairpin through a central router.
+  encapsulates them directly toward the destination node's SID.
 - **Two encodings.** ``usid`` (RFC 9800 microSID, default): a path of up to
   four waypoints fits in a 40-byte outer header with no SRH. ``encap``: full
   128-bit SIDs in an SRH.
@@ -36,8 +34,7 @@ network node in the path.
 - **Automatic steering (optional).** With an underlay topology file and the
   telemetry agent running on the fabric switches, the server watches link
   load and moves heavy VM pairs off congested links on its own, choosing
-  their new path with a built-in path computation (CSPF). Not needed for
-  anything else.
+  their new path with a built-in path computation (CSPF).
 - **Tools.** An ``openstack srv6 ...`` CLI plugin and Horizon panels
   (project: domains and associations; admin: locators, TE paths, topology).
 
