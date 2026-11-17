@@ -13,58 +13,14 @@ What it does
 ------------
 
 The plugin adds a new Neutron routing mode for the traffic between a
-project's networks, based on Segment Routing over IPv6 (SRv6). It builds no new
-data plane: the Linux kernel of every node already implements SRv6, and the
-plugin connects it to the Open vSwitch agent that already wires the VMs, so
-traffic leaving a tenant network is routed by the kernel and carried over
-the IPv6 underlay in SRv6. Routing is distributed: the node of the sender
-encapsulates every packet straight toward the destination node, with no
-network node in the path. Because the sender writes the path into the
-packet, the plugin can also steer traffic through chosen waypoints. It is a
-standalone package: Neutron is not modified, VMs need no configuration and
-keep using their subnet's gateway, and networks outside a domain behave as
-before.
+project's networks, based on Segment Routing over IPv6 (SRv6). It bridges
+the Linux kernel, which already implements SRv6, with the Open vSwitch agent
+of every node. It is a standalone package: Neutron is not modified, VMs need
+no configuration and keep using their subnet's gateway, and networks outside
+a domain behave as before.
 
-- **Domains.** Networks grouped into an SRv6 domain reach each other, as if
-  attached to one router. Domains are isolated from each other, even with
-  overlapping addresses.
-- **Two encodings.** ``usid`` (RFC 9800 microSID, default): a direct route
-  costs a 40-byte outer header, and up to four waypoints still fit in it.
-  ``encap``: full 128-bit SIDs in a Segment Routing Header (SRH), 64 bytes.
-- **Traffic engineering (admin).** A TE path forces part of a domain's
-  traffic through chosen waypoints: other compute nodes or, with a topology
-  file, fabric switches.
-- **Automatic steering (optional).** With a topology file and the telemetry
-  agent on the fabric switches, the server moves heavy VM pairs off
-  congested links on its own.
-- **Tools.** An ``openstack srv6 ...`` CLI plugin and Horizon panels.
-
-Out of scope: north-south traffic (a domain network has no router, so no
-floating IP) and traffic between domains.
-
-
-How it works
-------------
-
-SRv6 in one paragraph
-~~~~~~~~~~~~~~~~~~~~~
-
-With Segment Routing the source node writes in the packet a list of
-*segments*, instructions that the nodes along the path execute; the
-per-flow state lives only at the source. In SRv6 each segment identifier
-(*SID*) is an IPv6 address made of a **locator**, a prefix that routes to
-the node owning the SID, and a **function**, which selects what that node
-does with the packet. Transit routers only see an IPv6 destination address,
-so they forward SRv6 packets as plain IPv6. In Linux, SRv6 is configured
-with ordinary routes: ``encap seg6`` wraps matching packets in an outer IPv6
-header toward a SID, and ``encap seg6local`` binds a SID to a behaviour,
-such as ``End`` (go to the next segment) or ``End.DT46`` (remove the outer
-header and look the inner packet up in a given routing table).
-
-Resources
-~~~~~~~~~
-
-The plugin adds four resources to the Neutron API:
+Concepts
+~~~~~~~~
 
 .. image:: doc/images/resources.png
    :alt: Resources added to the Neutron API: a network has at most one
@@ -72,36 +28,27 @@ The plugin adds four resources to the Neutron API:
          has TE paths, whose waypoints are locators, one per compute node.
    :width: 460
 
-**SRv6 domain** -- takes the place of a Neutron router: a set of networks of
-one project between which traffic is routed over SRv6. At creation the
-server gives it a **function id** from a pool (``0xe000``-``0xefff``); all
-its SIDs and its routing table on every node derive from it.
+=======================  =====================================================
+Resource                 Meaning
+=======================  =====================================================
+SRv6 domain              A set of networks of one project, routed to each
+                         other over SRv6. Gets a function id
+                         (``0xe000``-``0xefff``) from which its SIDs and its
+                         routing table on every node derive.
+Network association      Joins a network to a domain, like a router interface
+                         joins a network to a router.
+Locator                  A node's /48 prefix (e.g. ``fc00:0:2::/48``), set in
+                         the agent config. A domain's SID on a node is the
+                         locator plus the domain's function id.
+TE path (admin)          Waypoints (compute nodes or fabric switches) that
+                         part of a domain's traffic must cross. Written by
+                         the admin, or created by the server to relieve a
+                         congested link.
+=======================  =====================================================
 
-**Network association** -- joins a network to a domain, as a router
-interface joins a network to a router. Accepted only if the network belongs
-to the domain's project, is not external, has no router interface, is in no
-other domain and has no subnet overlapping the domain's (they all share one
-routing table). Neutron callbacks keep these rules true afterwards.
-
-**Locator** -- the /48 prefix of a node (e.g. ``fc00:0:2::/48``), set in its
-agent's configuration and reported to the server. With ``usid`` all
-locators share one /32 block and the third group names the node:
-``0x0001``-``0xdfff`` are nodes, ``0xe000``-``0xefff`` function ids, so a
-domain's function is never mistaken for the next node of a path. A domain's
-SID on a node is the node's locator plus the domain's function id.
-
-**TE path** (admin only) -- the waypoints, compute nodes or fabric switches,
-that selected traffic must cross. It selects traffic by destination node or
-VM, optionally restricted to a source node or VM; the most specific match
-wins. It is written by the admin, or created by the server to relieve a
-congested link. When a waypoint has no locator or is down, the path is
-marked ``DEGRADED`` and its traffic falls back to the direct route.
 
 Architecture
-~~~~~~~~~~~~
-
-Every component attaches to an existing Neutron extension point. The server
-takes every routing decision; each compute node applies it:
+------------
 
 .. image:: doc/images/architecture.png
    :alt: Components of the plugin: on the controller, neutron-server with
@@ -110,46 +57,55 @@ takes every routing decision; each compute node applies it:
          agent with the SRv6 extension programming the kernel via privsep.
    :width: 520
 
-**Server.** Five API extensions add the domains with their associations, the
-locators, the TE paths, and two read-only collections of fabric
-measurements (load per link, traffic per VM pair). Domains and associations
-belong to the project's members, the rest to the admin. The state lives in
-new tables of the Neutron database, created by ``neutron-db-manage``; unique
-constraints enforce the main rules, so two concurrent requests cannot
-bypass them. ``Srv6Plugin`` implements the API. For each domain it builds a
-**payload** with the complete state the nodes need: the function id and
-routing table, each network with its MTU and subnets, the locator of every
-node, and one route per address of each active VM, naming the node that
-hosts it. When a TE path applies to a route, its waypoints are attached to
-that route as a list of SIDs. Two periodic tasks run beside it: the
-**liveness monitor** marks TE paths ``DEGRADED`` when a waypoint goes down,
-and the optional **TE re-optimiser** reads the link load posted by the
-fabric switches and, when a link stays congested, moves the heaviest VM pair
-onto a less loaded path (an automatic TE path, removed when the pair goes
-idle or the link has room again).
+======================  ===============  =====================================
+Component               Runs in          Role
+======================  ===============  =====================================
+API extensions          neutron-server   REST resources and policies.
+                                         ``extensions/``, ``api/``,
+                                         ``policies/``
+``Srv6Plugin``          neutron-server   Validates requests, allocates
+                                         function ids, builds each domain's
+                                         payload, notifies the agents.
+                                         ``services/plugin.py``
+TE resolver             neutron-server   Turns TE paths into SID lists per
+                                         route. ``services/te_resolver.py``
+Liveness monitor        neutron-server   Marks TE paths ``DEGRADED`` when a
+                                         waypoint dies, active when it is back.
+                                         ``services/te_liveness.py``
+TE re-optimiser         neutron-server   Optional: moves heavy VM pairs off
+                                         congested links.
+                                         ``services/underlay/``
+Agent extension         OVS agent,       Applies the payloads to the kernel.
+                        every node       ``agent/``
+Privileged helpers      privsep daemon   ``ip``, ``modprobe``, ``nft`` as
+                                         root. ``privileged/``
+Fabric agent            fabric switches  Optional: posts link load and heavy
+                                         VM pairs.
+                                         ``tools/srv6-fabric-agent.py``
+======================  ===============  =====================================
 
-**Messaging.** After every committed change the server sends a fanout cast
-to all agents: the whole payload of a domain when the domain changes
-(``domain_updated``), only the changed routes when a VM starts, stops or
-moves (``routes_updated``). Messages can be lost or arrive out of order, so
-each agent also calls ``sync_state`` at start-up and every
-``resync_interval`` (300 s), which returns every payload: a node cannot
-drift from the server for longer than one period.
+How a change reaches the nodes:
 
-**Node.** On each compute node, the SRv6 extension of the Open vSwitch agent
-keeps the last payload of every domain and makes the kernel match it,
-through a privsep daemon. A domain is built only on a node that hosts one of
-its VMs.
+1. An API call (or a VM starting, stopping or moving) changes the state in
+   the Neutron database.
+2. ``Srv6Plugin`` builds the domain's **payload**: function id, networks
+   with their subnets and MTU, every node's locator, and one route per VM
+   address naming the node that hosts it, with the SID list of any TE path.
+3. The server sends a fanout cast to every agent: ``domain_updated`` (the
+   whole payload) or ``routes_updated`` (only the changed routes).
+4. Each agent makes its kernel match the payload. Domains are built only on
+   nodes that host one of their VMs.
+5. Every agent also calls ``sync_state`` at start-up and every
+   ``resync_interval`` (300 s) to repair lost or reordered messages.
 
-Data plane
-~~~~~~~~~~
+What the agent installs
+~~~~~~~~~~~~~~~~~~~~~~~
 
-Take domain ``red`` with function id ``0xe005`` (routing table 57349), on
-node 2 (locator ``fc00:0:2::/48``), which hosts ``vm-a2`` (``10.50.1.12`` on
-``net-a``) and talks to ``vm-b3`` (``10.50.2.13`` on ``net-b``) on node 3.
-The agent installs the equivalent of::
+For domain ``red`` (function id ``0xe005``, table 57349) on node 2 (locator
+``fc00:0:2::/48``), with ``vm-a2`` on ``net-a`` and a remote ``vm-b3``
+(``10.50.2.13``) on node 3, the agent installs the equivalent of::
 
-    # VRF and its seal
+    # VRF, sealed by an unreachable default
     ip link add sv6vrf-57349 type vrf table 57349
     ip -4 route add unreachable default metric 4278198272 table 57349
     ip -6 route add unreachable default metric 4278198272 table 57349
@@ -161,71 +117,38 @@ The agent installs the equivalent of::
         -- set interface svp-57349-1 type=internal
     ip link set svp-57349-1 master sv6vrf-57349
     ip addr add 10.50.1.1/24 dev svp-57349-1
-    # route to a remote VM, and its rule
+    # route to a remote VM, and the rule that sends it to the underlay
     ip route add 10.50.2.13/32 encap seg6 mode encap.red \
         segs fc00:0:3:e005:: dev eth1 table 57349
     ip -6 rule add pref 999 iif sv6vrf-57349 \
         to fc00:0:3:e005::/128 lookup main
 
-These are five kinds of kernel objects per domain:
+- **VRF** (``sv6vrf-<function id>``): the domain's routing table. The
+  *seal* ends lookups that find nothing, so traffic never leaks into the
+  host table.
+- **Decapsulation SID** (``End.DT46``): strips the outer header of arriving
+  packets and looks them up in the VRF.
+- **Gateway port** (``svp-<function id>-<vlan>``): an OVS internal port
+  holding the subnet gateway address. Every node hosting the network has
+  its own.
+- **Route per remote VM**: encapsulates toward the decapsulation SID on that
+  VM's node. Per VM, not per subnet, so a TE path can steer one VM.
+- **Rule 999**: sends the encapsulated packet to the main table, where the
+  underlay route forwards it.
 
-- The **VRF** is the domain's routing table on the node. It is closed by a
-  **seal**, an unreachable default route, so a lookup that finds nothing in
-  the VRF ends there instead of falling through to the host's main table.
-- The **decapsulation SID** (``End.DT46``) removes the outer header of an
-  arriving packet and looks the inner packet up in the VRF.
-- A **gateway port** is an Open vSwitch internal port on ``br-int``, tagged
-  with the network's local VLAN and placed in the VRF, holding the gateway
-  address of each subnet. It plays the router interface: every node hosting
-  ``net-a`` has its own ``10.50.1.1``, as in DVR.
-- Each remote VM gets a /32 or /128 **route** in the VRF that wraps the
-  packet in an outer IPv6 header addressed to the decapsulation SID on that
-  VM's node. With a single segment no SRH is needed, so the encapsulation
-  is just the 40-byte IPv6 header. Routes are per VM, not per subnet,
-  because VMs of one subnet can sit on different nodes; it also lets a TE
-  path steer a single VM.
-- The **policy rule** at priority 999 sends the encapsulated packet to the
-  main table, where the underlay route forwards it. Without it the kernel
-  would look the outer packet up in the VRF again, hit the seal and drop it.
+Waypoints and isolation
+~~~~~~~~~~~~~~~~~~~~~~~
 
-So ``vm-a2`` sends to its gateway ``10.50.1.1``; the VRF on node 2 matches
-the route to ``10.50.2.13`` and encapsulates toward ``fc00:0:3:e005::``; the
-underlay delivers it to node 3, where ``End.DT46`` puts the inner packet
-into ``red``'s VRF, and the connected route of ``net-b`` hands it to
-``vm-b3``. No router namespace or L3 agent is involved.
-
-Steering through waypoints
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Every node that may be a waypoint installs a **uN SID** on its whole
-locator (``End`` with the ``next-csid`` flavour). It never decapsulates, so
-compute nodes without VMs and fabric switches can both serve. To send
-``vm-a2``'s traffic to ``vm-b3`` through node 1, node 2 only changes the
-route's destination to the container ``fc00:0:1:3:e005::``: the 32-bit
-block, the micro-SIDs of node 1 and node 3, and the function. The underlay
-routes it to node 1, whose uN shifts the micro-SIDs left by 16 bits and
-forwards the packet to ``fc00:0:3:e005::``. The destination takes two of
-the six micro-SIDs in a container, so up to four waypoints cost no extra
-byte; a longer path moves the rest into an SRH. A TE path for a single
-source VM uses a dedicated *steer table*, selected by a rule on the source
-address and gateway port.
-
-Isolation between domains
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The VRF separates domains, even with overlapping addresses, and the agent
-closes the three other ways out of a domain:
-
-- A packet to an address the VRF does not know ends at the seal instead of
-  continuing in the host's main table.
-- A packet to an address of the host itself would be delivered by the
-  ``local`` table, which Linux consults first; the agent moves that rule
-  after the VRF rule, so the packet reaches the seal while host traffic
-  still uses ``local``.
-- A VM could craft an SRv6 packet addressed to another domain's SID. Like
-  the edge filtering of RFC 8754, an nftables table drops, before routing,
-  every packet from a gateway port that is addressed to a node SID or
-  carries an SRH.
+- **Waypoints.** Every node installs a uN SID (``End`` with ``next-csid``) on
+  its locator, so any node or fabric switch can be a waypoint. A TE path
+  only changes the route's destination, e.g. ``fc00:0:1:3:e005::`` goes
+  through node 1 to node 3. Up to four waypoints fit in the 40-byte header;
+  a longer path adds an SRH.
+- **Isolation.** The VRF separates domains, even with overlapping addresses.
+  The seal blocks unknown destinations, the ``local`` rule is moved after
+  the VRF rules so VMs cannot reach host addresses, and an nftables table
+  drops packets from a gateway port that are addressed to a node SID or
+  carry an SRH (RFC 8754 edge filtering).
 
 
 Repository layout
@@ -417,4 +340,17 @@ Changing ``dataplane_encoding`` requires a deployment with no domains:
 restart the server, then the agents.
 
 
-License: Apache 2.0.
+Development
+-----------
+
+::
+
+    tox -e py3         # unit tests (stestr)
+    tox -e pep8        # flake8
+    tox -e dashboard   # Horizon panel tests (installs Horizon from git)
+
+
+License
+-------
+
+Apache 2.0, see ``LICENSE``.
