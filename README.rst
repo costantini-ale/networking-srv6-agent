@@ -112,37 +112,64 @@ programs the kernel directly, with no software router in between:
 
 - SRv6 routes (``seg6`` encapsulation and ``seg6local`` SIDs) need
   ``CONFIG_IPV6_SEG6_LWTUNNEL``. Stock Ubuntu and Debian kernels have it.
-- Each domain is a Linux VRF, which needs the ``vrf`` module. Ubuntu cloud
-  images ship it in a separate package: install
-  ``linux-modules-extra-$(uname -r)``. The agent loads the module itself.
+- Each domain is a Linux VRF, which needs the ``vrf`` kernel module. Ubuntu
+  cloud images ship it in a separate package, so install it once on each
+  node (the hosts, not the VMs) before stacking:
+  ``sudo apt-get install linux-modules-extra-$(uname -r)``. The agent loads
+  the module itself.
 - The ``usid`` encoding (the default) uses microSID routes that only
   **kernel and iproute2 6.1 or newer** understand (Ubuntu 24.04 or later).
   The agent probes this at start-up; the server logs an error naming any
   node that lacks it. ``encap`` works on older kernels.
-- The agent sets the sysctls SRv6 needs (IPv6 forwarding, ``seg6_enabled``,
-  ``vrf.strict_mode``, ``rp_filter`` off, ...) when it starts. If your
-  configuration management owns them, set ``apply_sysctls = false``: the
-  agent then only checks them.
 
-**An IPv6 underlay that routes every locator.** Each node gets a
-**locator**, a unique IPv6 prefix (e.g. ``fc00:0:1::/48``), and its SIDs are
-addresses inside it. Packets between nodes are sent to these addresses, so
-every node must have a route to every other node's locator: on one shared
-segment, a static route per peer is enough (see the example below); in a
-routed fabric, the switches must route them (an IGP or static routes). The
-plugin uses the underlay but never configures it. With ``usid``, every
-locator must be a /48 inside one common /32 block (``fc00:0:<n>::/48``).
-The underlay interface is found from those routes, or set with
-``underlay_interface``.
+**An IPv6 underlay between the nodes.** The *underlay* is the physical
+network that connects the OpenStack nodes; SRv6 packets travel over it as
+plain IPv6. It can be the same NIC and network that already carries
+management or VXLAN traffic. The plugin uses it but never configures it, so
+before stacking every node needs:
 
-**Room in the underlay MTU.** SRv6 wraps each packet in an extra IPv6
-header: 40 bytes with ``usid`` (still 40 with up to four TE waypoints), 64
-bytes with ``encap`` plus 16 bytes per TE waypoint. A full-size VM packet
-fits only if the underlay MTU exceeds the network MTU by that much (e.g. a
-1450-byte VXLAN network over a 1500-byte underlay leaves 50 bytes: enough for
-``usid``, not for ``encap``).
-The agent logs a warning when it does not fit; raise the underlay MTU or
-lower the network MTU.
+- **An IPv6 address on the underlay NIC**, any address that the other nodes
+  can reach (e.g. ``fd00::1/64``).
+- **A locator**: a unique IPv6 prefix for this node, e.g.
+  ``fc00:0:1::/48``, set with ``SRV6_LOCATOR``. It is not an interface
+  address: the node's SIDs are addresses inside it, and the agent installs
+  the routes that answer them. With ``usid`` (the default), every locator
+  must be a /48 inside the same /32 block, so the nodes differ only in the
+  third group (``fc00:0:1::/48``, ``fc00:0:2::/48``, ...).
+- **A route to every other node's locator**, via that node's underlay
+  address. When the nodes share one L2 segment, one static route per peer
+  is enough (``ip -6 route add fc00:0:2::/48 via fd00::2``, see the example
+  below). In a routed fabric, the switches must route the locators instead
+  (an IGP or static routes).
+
+The agent finds the underlay NIC from the route to each peer's locator; set
+``SRV6_UNDERLAY_INTERFACE`` only to force one. Check the underlay before
+stacking: from every node, ``ping -6`` every other node's underlay address.
+
+**An underlay MTU large enough for the extra header.** To carry a VM's
+packet to another node, SRv6 puts it inside a new outer IPv6 header, so the
+packet on the underlay is bigger than the one the VM sent. The extra bytes
+are:
+
+=============  ===============================  ==========================
+Encoding       Direct route                     Each TE waypoint adds
+=============  ===============================  ==========================
+``usid``       40 bytes                         nothing for the first
+                                                four, then 16 bytes each
+``encap``      64 bytes                         16 bytes
+=============  ===============================  ==========================
+
+The rule: **underlay MTU >= network MTU + extra bytes**. A VM sends packets up
+to its network's MTU (``openstack network show <net> -c mtu``); the underlay
+MTU is the MTU of the underlay NIC (``ip link show <nic>``). Example: on a
+1500-byte underlay, Neutron gives VXLAN networks an MTU of 1450, which leaves
+50 bytes. That fits ``usid`` (40) but not ``encap`` (64 or more).
+
+When it does not fit, small packets still pass but full-size ones are
+dropped, so ping works while large transfers stall. The agent logs a warning
+with the largest network MTU that would fit. Fix it either way: raise the
+underlay MTU (e.g. jumbo frames, 9000), or lower the network MTU
+(``openstack network set --mtu 1400 <net>``).
 
 **Software.** Python 3.11 or newer, and Neutron from the same OpenStack
 release as the rest of the cloud (with DevStack: the branch you stack).

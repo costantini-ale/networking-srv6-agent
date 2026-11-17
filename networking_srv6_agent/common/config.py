@@ -213,11 +213,24 @@ srv6_agent_opts = [
     cfg.BoolOpt(
         'apply_sysctls',
         default=True,
-        help=_("Whether the agent sets the kernel sysctls SRv6 requires "
-               "(seg6_enabled, forwarding, vrf strict_mode, rp_filter). Set "
-               "False if the node's sysctls are managed by configuration "
-               "management, in which case the agent only verifies them and "
-               "logs an error when one is wrong.")),
+        help=_("Whether the agent sets, at start-up, the kernel sysctls SRv6 "
+               "needs. Most of them fail silently when wrong. "
+               "net.ipv6.conf.all.forwarding and net.ipv4.ip_forward = 1: "
+               "the node routes the packets of its VMs. "
+               "net.ipv6.conf.{all,default,lo}.seg6_enabled = 1: otherwise "
+               "the kernel drops SRv6 packets that carry an SRH. "
+               "net.vrf.strict_mode = 1: End.DT46, the SID that delivers "
+               "traffic into a domain's VRF, is refused without it. "
+               "net.ipv4.conf.{all,default}.rp_filter = 0: otherwise "
+               "decapsulated packets are discarded with no counter moving. "
+               "net.ipv4.{tcp,udp}_l3mdev_accept = 0 (the default, "
+               "enforced): at 1 the host's own services would accept "
+               "connections from inside every tenant VRF. "
+               "net.ipv6.seg6_flowlabel = 1: the outer flow label is hashed "
+               "from the inner flow, so the underlay's ECMP spreads flows "
+               "over all paths instead of one. Set False if configuration "
+               "management owns these sysctls: the agent then only checks "
+               "them and logs an error for each wrong one.")),
 ]
 
 
