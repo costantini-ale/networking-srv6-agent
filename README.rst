@@ -86,8 +86,7 @@ Repository layout:
 
 ``tools/``
   ``srv6-fabric-agent.py``, the optional telemetry agent for underlay switches
-  (link load and heavy VM pairs); ``django-manage.py``, used to run the
-  dashboard tests.
+  (link load and heavy VM pairs).
 
 Each node announces its **locator** (an IPv6 prefix, e.g. ``fc00:0:1::/48``);
 a domain's SID on that node is the locator plus the domain's function id.
@@ -101,15 +100,52 @@ What a cloud needs to run the plugin, and a worked three-node example.
 Requirements
 ~~~~~~~~~~~~
 
-- **ML2/OVS with VXLAN tunnels.** The agent side is an extension of the OVS
-  L2 agent. ML2/OVN (no L2 agent) and linuxbridge are not supported.
-- Linux kernel with ``CONFIG_IPV6_SEG6_LWTUNNEL`` and the ``vrf`` module
-  (on Ubuntu cloud images: ``linux-modules-extra-$(uname -r)``). For
-  ``usid``: kernel and iproute2 >= 6.1.
-- An **IPv6-routable underlay** between all nodes: each node's locator must
-  be reachable from every other node. With ``usid`` all locators are /48 in
-  one /32 block. The underlay is yours to build; the plugin only uses it.
-- Python >= 3.11; Neutron from the same OpenStack release as DevStack.
+**Neutron with ML2/OVS and VXLAN tunnels.** The node side of the plugin is
+an extension of the Open vSwitch L2 agent (``neutron-openvswitch-agent``), so
+every node that hosts VMs must run that agent. ML2/OVN has no L2 agent and
+linuxbridge has a different one: neither is supported. VXLAN still carries
+the traffic between VMs of the *same* network; SRv6 only carries the traffic
+between networks of a domain.
+
+**A Linux kernel with SRv6 and VRF support, on every node.** The plugin
+programs the kernel directly, with no software router in between:
+
+- SRv6 routes (``seg6`` encapsulation and ``seg6local`` SIDs) need
+  ``CONFIG_IPV6_SEG6_LWTUNNEL``. Stock Ubuntu and Debian kernels have it.
+- Each domain is a Linux VRF, which needs the ``vrf`` module. Ubuntu cloud
+  images ship it in a separate package: install
+  ``linux-modules-extra-$(uname -r)``. The agent loads the module itself.
+- The ``usid`` encoding (the default) uses microSID routes that only
+  **kernel and iproute2 6.1 or newer** understand (Ubuntu 24.04 or later).
+  The agent probes this at start-up; the server logs an error naming any
+  node that lacks it. ``encap`` works on older kernels.
+- The agent sets the sysctls SRv6 needs (IPv6 forwarding, ``seg6_enabled``,
+  ``vrf.strict_mode``, ``rp_filter`` off, ...) when it starts. If your
+  configuration management owns them, set ``apply_sysctls = false``: the
+  agent then only checks them.
+
+**An IPv6 underlay that routes every locator.** Each node gets a
+**locator**, a unique IPv6 prefix (e.g. ``fc00:0:1::/48``), and its SIDs are
+addresses inside it. Packets between nodes are sent to these addresses, so
+every node must have a route to every other node's locator: on one shared
+segment, a static route per peer is enough (see the example below); in a
+routed fabric, the switches must route them (an IGP or static routes). The
+plugin uses the underlay but never configures it. With ``usid``, every
+locator must be a /48 inside one common /32 block (``fc00:0:<n>::/48``).
+The underlay interface is found from those routes, or set with
+``underlay_interface``.
+
+**Room in the underlay MTU.** SRv6 wraps each packet in an extra IPv6
+header: 40 bytes with ``usid`` (still 40 with up to four TE waypoints), 64
+bytes with ``encap`` plus 16 bytes per TE waypoint. A full-size VM packet
+fits only if the underlay MTU exceeds the network MTU by that much (e.g. a
+1450-byte VXLAN network over a 1500-byte underlay leaves 50 bytes: enough for
+``usid``, not for ``encap``).
+The agent logs a warning when it does not fit; raise the underlay MTU or
+lower the network MTU.
+
+**Software.** Python 3.11 or newer, and Neutron from the same OpenStack
+release as the rest of the cloud (with DevStack: the branch you stack).
 
 DevStack settings
 ~~~~~~~~~~~~~~~~~
