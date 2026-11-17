@@ -268,8 +268,7 @@ again. Manual TE paths never use it: their waypoints are the ones you give.
 It needs a topology file on the controller (without it, link state is
 disabled and fabric nodes cannot be waypoints) and the telemetry agent on
 every fabric switch (without it there is nothing to measure, so the server
-never steers anything). How to set both up: *Optional: a fabric for
-link state and automatic steering* in
+never steers anything). How to set both up: *Build the fabric* in
 `DEPLOYMENT.rst <DEPLOYMENT.rst>`__. Watch it::
 
     openstack srv6 link list --long        # load per link, stale flag
@@ -377,8 +376,8 @@ Deploying
 The plugin needs ML2/OVS with VXLAN, a Linux kernel with SRv6 and VRF
 support (6.1 or newer for ``usid``), and an IPv6 underlay that routes every
 node's locator. The `deployment guide <DEPLOYMENT.rst>`__ explains each
-requirement, lists the DevStack settings and walks through a three-node
-example, plus the optional fabric for link state and automatic steering.
+requirement, lists the DevStack settings and walks through a complete
+test cloud: three DevStack nodes on a spine-leaf fabric of SRv6 switches.
 
 
 Configuration reference

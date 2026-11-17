@@ -4,7 +4,7 @@
 `up` reads the plugin's topology file ([srv6] topology_file) and builds
 everything it describes:
   - every link: an isolated libvirt network (MTU 9000);
-  - every node not in --hosts: a switch VM (Ubuntu cloud image) with its
+  - every node not in --hosts: a switch VM (from a cloud image) with its
     link addresses, static ECMP routes, its own SID and the telemetry agent;
   - every host (a DevStack node, a running libvirt domain here): one NIC per
     link, then over SSH its addresses and routes (run again at boot);
@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # disks live in libvirt's "default" storage pool: no root needed
@@ -213,7 +214,10 @@ def user_data(node, nodes, links, hosts, ssh_key, neutron_url, openrc):
         user['ssh_authorized_keys'] = [open(ssh_key).read().strip()]
     return '#cloud-config\n' + json.dumps({
         'hostname': node, 'users': [user], 'ssh_pwauth': False,
-        'write_files': files, 'runcmd': run}, indent=1)
+        'write_files': files, 'runcmd': run,
+        # virt-install --cloud-init boots an install phase that a reboot
+        # ends with power off: power off now, up() starts the final VM
+        'power_state': {'mode': 'poweroff', 'condition': True}}, indent=1)
 
 
 # --- libvirt ----------------------------------------------------------------
@@ -327,10 +331,12 @@ def _up(nodes, links, hosts, args, tmp, neutron_url, openrc):
               '--format', 'qcow2')
         virsh('vol-upload', '--pool', POOL, BASE, args.image)
     switches = [n for n in nodes if n not in hosts]
+    new = []
     for k, n in enumerate(switches, 1):
         if exists('dom', n):
             print('%s: exists, left alone' % n)
             continue
+        new.append(n)
         disk = 'srv6-fabric-%s.qcow2' % n
         mgmt_mac = '52:54:00:f0:00:%02x' % k
         ud, nc = os.path.join(tmp, 'ud'), os.path.join(tmp, 'nc')
@@ -348,11 +354,21 @@ def _up(nodes, links, hosts, args, tmp, neutron_url, openrc):
                          % (netname(lk), ends(lk, n)[3])]
         sh('virt-install', '-q', '--connect', 'qemu:///system', '--import',
            '--name', n, '--memory', str(args.memory), '--vcpus', '1',
-           '--osinfo', 'detect=on,name=ubuntu24.04',
+           '--osinfo', 'detect=on,require=off',     # any distribution
            '--disk', 'vol=%s/%s,bus=virtio' % (POOL, disk),
            '--cloud-init', 'user-data=%s,network-config=%s' % (ud, nc),
            *nics, '--graphics', 'none', '--noautoconsole')
-        print('%s: created' % n)
+        print('%s: created, configuring itself' % n)
+    # first boot: cloud-init configures the switch, then powers it off
+    deadline = time.time() + 900
+    while new:
+        for n in [n for n in new if not running(n)]:
+            virsh('start', n)
+            new.remove(n)
+            print('%s: ready' % n)
+        if new and time.time() > deadline:
+            sys.exit('%s: first boot not done after 15 min' % ', '.join(new))
+        time.sleep(5)
 
     for h in hosts:
         have = virsh('domiflist', h).lower()
@@ -390,6 +406,7 @@ def down(nodes, links, hosts, controller):
         if exists('net-', netname(lk)):
             virsh('net-destroy', netname(lk), check=False)
             virsh('net-undefine', netname(lk))
+    virsh('vol-delete', '--pool', POOL, BASE, check=False)
     print('fabric removed; on each host, restore its underlay routes')
 
 
@@ -441,7 +458,7 @@ def main():
     p.add_argument('--hosts', default='',
                    help='the DevStack nodes, NAME[=SSH address],...')
     p.add_argument('--controller', help='up/down: the host running Neutron')
-    p.add_argument('--image', help='up: Ubuntu 24.04 cloud image')
+    p.add_argument('--image', help='up: cloud image for the switches')
     p.add_argument('--ssh-key', help='up: public key for user stack')
     p.add_argument('--memory', type=int, default=1024,
                    help='up: MB of RAM per switch (default 1024)')
