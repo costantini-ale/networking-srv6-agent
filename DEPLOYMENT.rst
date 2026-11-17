@@ -439,33 +439,84 @@ force one.
 DevStack settings
 ~~~~~~~~~~~~~~~~~
 
-``enable_plugin networking-srv6-agent ...`` installs the package, enables
-the service plugin and the agent extension, writes ``[srv6]`` /
-``[srv6_agent]``, runs the DB migrations and, if Horizon is enabled,
-installs the SRv6 panels. Defaults live in ``devstack/settings``.
+The plugin is configured from ``local.conf``, in the ``[[local|localrc]]``
+section, next to the ``enable_plugin`` line. Every variable starts with
+``SRV6_``, has a default in ``devstack/settings`` and is written by
+``stack.sh`` into the Neutron configuration, so the example in `Install
+DevStack`_ only sets the one without a default. ``enable_plugin
+networking-srv6-agent ...`` also installs the package, enables the service
+plugin and the agent extension, runs the database migrations and, if
+Horizon is enabled, installs the SRv6 panels.
+
+Which node reads a variable depends on the services that node runs:
+``q-svc`` is the controller (the Neutron server), ``q-agt`` is any node
+with an OVS agent (the controller too, in the example). A variable for a
+service the node does not run is ignored.
+
+Every node running ``q-agt``:
 
 =============================  ==================  ===========================
 Variable                       Default             Meaning
 =============================  ==================  ===========================
-``SRV6_LOCATOR``               required on q-agt   This node's locator; stack
-                                                   fails without it.
-``SRV6_UNDERLAY_INTERFACE``    auto                Underlay NIC; unset = from
-                                                   the route to the peers'
+``SRV6_LOCATOR``               none, **required**  This node's /48, unique per
+                                                   node (``stack.sh`` stops
+                                                   without it). Written to
+                                                   ``locator`` in
+                                                   ``[srv6_agent]``.
+``SRV6_UNDERLAY_INTERFACE``    unset               Underlay NIC. Leave unset:
+                                                   the agent finds it from the
+                                                   route to the other nodes'
                                                    locators.
-``SRV6_DATAPLANE_ENCODING``    ``usid``            ``usid`` or ``encap``
-                                                   (server).
-``SRV6_FUNCTION_ID_RANGES``    ``0xe000:0xefff``   Domain function ids
-                                                   (server). Do not change.
-``SRV6_TOPOLOGY_FILE``         unset               Underlay topology for link
-                                                   state and automatic
-                                                   steering (server).
-``SRV6_VRF_TABLE_BASE``        ``0``               VRF table = base + function
-                                                   id. Same on every node.
-``SRV6_RESYNC_INTERVAL``       ``300``             Seconds between full agent
-                                                   resyncs.
-``SRV6_DASHBOARD_ENABLE``      all panels          Horizon panel files to
-                                                   install.
+``SRV6_RESYNC_INTERVAL``       ``300``             Seconds between full
+                                                   resyncs of the node with
+                                                   the server.
 =============================  ==================  ===========================
+
+Every node, controller and computes (the agent computes a domain's VRF
+table from the same base as the server, so they must agree):
+
+=============================  ==================  ===========================
+Variable                       Default             Meaning
+=============================  ==================  ===========================
+``SRV6_VRF_TABLE_BASE``        ``0``               VRF table = base + domain
+                                                   function id.
+=============================  ==================  ===========================
+
+Controller only (``q-svc``):
+
+=============================  ==================  ===========================
+Variable                       Default             Meaning
+=============================  ==================  ===========================
+``SRV6_DATAPLANE_ENCODING``    ``usid``            ``usid`` (microSID, needs
+                                                   kernel and iproute2 6.1+)
+                                                   or ``encap`` (full SIDs).
+``SRV6_FUNCTION_ID_RANGES``    ``0xe000:0xefff``   Range of the domain
+                                                   function ids. Do not
+                                                   change.
+``SRV6_TOPOLOGY_FILE``         unset               Path of the `Topology
+                                                   file`_. Set it to get
+                                                   link state and automatic
+                                                   steering; unset, neither.
+=============================  ==================  ===========================
+
+Controller with Horizon only:
+
+=============================  ==================  ===========================
+Variable                       Default             Meaning
+=============================  ==================  ===========================
+``SRV6_DASHBOARD_ENABLE``      all SRv6 panels     Horizon panel files to
+                                                   install. Leave unset.
+=============================  ==================  ===========================
+
+For example, to run the controller with full SIDs and the topology file,
+add to node1's ``local.conf``::
+
+    SRV6_DATAPLANE_ENCODING=encap
+    SRV6_TOPOLOGY_FILE=/opt/stack/networking-srv6-agent/tools/fabric.topo
+
+After changing a value, run ``./stack.sh`` again on that node
+or edit the same option in ``neutron.conf`` / the ML2 file and restart
+the service.
 
 Topology file
 ~~~~~~~~~~~~~
