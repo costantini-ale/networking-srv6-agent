@@ -102,6 +102,10 @@ If the ``default`` pool is missing::
     virsh pool-build default
     virsh pool-start default && virsh pool-autostart default
 
+If that fails with *Storage source conflict*, another pool already uses
+the directory: give ``default`` its own,
+``--target /var/lib/libvirt/images/srv6-lab``.
+
 Get the plugin (for the fabric script and topology file), the Ubuntu 24.04
 cloud image, and an SSH key::
 
@@ -176,8 +180,9 @@ start them for good::
         virsh start node$i
     done
 
-Check that you can log in (this also records the host keys, which the
-fabric script needs) and that the kernel has what the plugin needs::
+Give them a minute to boot. Then check that you can log in (this also
+records the host keys, which the fabric script needs) and that the kernel
+has what the plugin needs::
 
     for i in 1 2 3; do
         ssh -o StrictHostKeyChecking=accept-new stack@192.168.122.10$i \
@@ -492,16 +497,6 @@ the largest network MTU that fits. Fix one side::
 
     sudo ip link set <nic> mtu 9000              # raise the underlay MTU
     openstack network set --mtu 1400 <net>       # or lower the network MTU
-
-Physical switches
-~~~~~~~~~~~~~~~~~
-
-The script only builds VMs. For real switches, cable them as the topology
-file says and run on each the script that ``tools/srv6-fabric-lab.py config
-tools/fabric.topo --hosts ... <switch>`` prints (it finds NICs by MAC: edit
-the ``nic`` lines), plus the telemetry agent as ``user_data`` in the script
-installs it.
-
 
 Deploy on physical nodes
 ------------------------
